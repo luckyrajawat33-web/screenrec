@@ -38,7 +38,7 @@ except ImportError:
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-VERSION  = "3.3"
+VERSION  = "3.4"
 APP_NAME = "ScreenSee"
 
 CANVAS_PRESETS = {
@@ -666,9 +666,16 @@ class Recorder:
 
     # ── Backend 1: Windows.Graphics.Capture (cursor excluded) ──
     def _start_wgc(self, region):
+        # NOTE on draw_border: some Windows 10 builds and early Windows 11
+        # builds reject IsBorderRequired=False at session-start time with
+        # "Toggling the capture border is not supported". The exception
+        # surfaces asynchronously inside the WGC worker thread, so the main
+        # thread happily proceeds while no frames are ever written. Passing
+        # True keeps the yellow recording indicator visible but it does NOT
+        # appear in the captured frames — it is a Windows-drawn overlay.
         cap = WindowsCapture(
             cursor_capture=False,
-            draw_border=False,
+            draw_border=True,
             monitor_index=1,
             window_name=None,
         )
@@ -686,7 +693,11 @@ class Recorder:
 
         @cap.event
         def on_closed():
-            pass
+            # If the session ends while we still think we are recording,
+            # WGC died on us. Flip the flag so the rest of the pipeline
+            # notices nothing is being captured.
+            if self.running:
+                self.running = False
 
         cap.start_free_threaded()
         self._capture = cap
@@ -1330,6 +1341,31 @@ class App(ctk.CTk):
                                         fg_color=self.OK,
                                         hover_color="#16a34a")
             self.welcome_status.configure(text="")
+
+            # Validate that we actually captured something before we try
+            # to load the bundle into the editor — otherwise we end up
+            # opening a malformed raw.mkv and showing a black preview.
+            frame_count = 0
+            try:
+                with open(os.path.join(self.bundle_path,
+                                       "meta.json")) as f:
+                    frame_count = json.load(f).get("frame_count", 0)
+            except Exception:
+                pass
+            if frame_count < 5:
+                messagebox.showerror(
+                    "Recording failed",
+                    "No frames were captured.\n\n"
+                    "The WGC capture session likely failed silently. "
+                    "Check the console for a 'Capture session threw an "
+                    "exception' message.\n\n"
+                    "Workarounds:\n"
+                    "  • Update Windows to the latest build, or\n"
+                    "  • pip uninstall windows-capture   (forces the "
+                    "mss fallback — cursor will be in the footage but "
+                    "recording will work).")
+                self.bundle_path = None
+                return
             self._show_editor()
 
     def _tick(self):
