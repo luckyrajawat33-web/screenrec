@@ -1,9 +1,16 @@
 """
-ScreenSee v2.0 — FocuSee-inspired screen recorder
+ScreenSee v3.0 — FocuSee-inspired screen recorder
 Modern UI built with CustomTkinter
+
+v3 changes vs v2:
+- Capture backend: windows-capture (cursor excluded) with mss fallback
+- Streaming pipeline: frames go straight to ffmpeg, never accumulate in RAM
+- Single monotonic clock (perf_counter) shared by frames and input events
+- Recordings persist as a .screensee bundle (raw.mkv + events.json + meta.json)
+- Export is now a pure function of (bundle, settings); preview reads bundle on demand
 """
 
-import os, sys, time, math, threading, subprocess
+import os, sys, time, math, json, tempfile, threading, subprocess
 import tkinter as tk
 import customtkinter as ctk
 from tkinter import messagebox, filedialog
@@ -19,11 +26,19 @@ except ImportError as e:
     HAS_DEPS = False
     MISSING  = str(e)
 
+# Optional: Windows.Graphics.Capture for true cursor exclusion.
+# Falls back to mss (cursor will appear in raw footage) if not installed.
+try:
+    from windows_capture import WindowsCapture, Frame, InternalCaptureControl
+    HAS_WGC = True
+except ImportError:
+    HAS_WGC = False
+
 # ── Theme
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-VERSION  = "2.0"
+VERSION  = "3.0"
 APP_NAME = "ScreenSee"
 
 CANVAS_PRESETS = {
@@ -367,52 +382,142 @@ def composite(rec_pil, cw, ch, bg_type, bg_val,
 
 # ============================================================
 #  RECORDER
+#
+#  v3 pipeline:
+#    capture backend ──┐
+#                      ├──► ffmpeg stdin (BGRA raw) ──► raw.mkv
+#    pynput listener ──┘                              + events.json
+#                                                     + meta.json
+#
+#  All timestamps are seconds-since-record-start using perf_counter,
+#  so frame PTS and input events share one clock.
 # ============================================================
 class Recorder:
     def __init__(self, fps=30):
-        self.fps     = fps
-        self.frames  = []   # (t, np BGR)
-        self.events  = []   # (t, type, x, y)
-        self.running = False
-        self._lock   = threading.Lock()
-        self._listener = None
-        self.region  = None
+        self.fps         = fps
+        self.bundle_path = None
+        self.running     = False
+        self._events     = []           # only input events live in RAM
+        self._frame_idx  = 0
+        self._last_write = -1.0
+        self._region     = None
+        self._t0         = 0.0
+        self._lock       = threading.Lock()
+        self._listener   = None
+        self._ffmpeg     = None
+        self._capture    = None         # windows-capture instance
+        self._cap_thread = None         # mss fallback thread
 
+    def _now(self):
+        return time.perf_counter() - self._t0
+
+    # ── Input event callbacks ──────────────────────────────────
     def _on_move(self, x, y):
         if self.running:
             with self._lock:
-                self.events.append((time.time(),"MOVE",x,y))
+                self._events.append((self._now(), "MOVE", x, y))
 
     def _on_click(self, x, y, button, pressed):
         if self.running:
             t = "CLICK" if pressed else "RELEASE"
             b = "L" if button == pmouse.Button.left else "R"
             with self._lock:
-                self.events.append((time.time(),f"{t}_{b}",x,y))
+                self._events.append((self._now(), f"{t}_{b}", x, y))
 
     def _on_scroll(self, x, y, dx, dy):
         if self.running:
-            d = "UP" if dy>0 else "DOWN"
+            d = "UP" if dy > 0 else "DOWN"
             with self._lock:
-                self.events.append((time.time(),f"SCROLL_{d}",x,y))
+                self._events.append((self._now(), f"SCROLL_{d}", x, y))
 
-    def _loop(self):
-        iv = 1.0/self.fps
-        with mss.mss() as sct:
-            while self.running:
-                t0 = time.time()
-                img = sct.grab(self.region)
-                f   = cv2.cvtColor(np.array(img), cv2.COLOR_BGRA2BGR)
-                with self._lock:
-                    self.frames.append((time.time(), f))
-                s = iv-(time.time()-t0)
-                if s>0: time.sleep(s)
+    # ── Frame write (called from capture backend) ──────────────
+    def _write_frame(self, bgra):
+        # Decimate to target fps; capture backend may deliver at monitor refresh.
+        now = self._now()
+        if now - self._last_write < (1.0 / self.fps) - 0.001:
+            return
+        self._last_write = now
+        try:
+            self._ffmpeg.stdin.write(bgra.tobytes())
+            self._frame_idx += 1
+        except (BrokenPipeError, OSError, ValueError):
+            self.running = False
 
-    def start(self, region):
-        self.region = region
-        self.frames.clear(); self.events.clear()
+    # ── Backend 1: Windows.Graphics.Capture (cursor excluded) ──
+    def _start_wgc(self, region):
+        cap = WindowsCapture(
+            cursor_capture=False,
+            draw_border=False,
+            monitor_index=1,
+            window_name=None,
+        )
+        l, t, w, h = region["left"], region["top"], region["width"], region["height"]
+
+        @cap.event
+        def on_frame_arrived(frame: "Frame", ctrl: "InternalCaptureControl"):
+            if not self.running:
+                ctrl.stop(); return
+            buf = frame.frame_buffer  # HxWx4 BGRA
+            if (buf.shape[1], buf.shape[0]) != (w, h):
+                buf = buf[t:t+h, l:l+w]
+            self._write_frame(buf)
+
+        @cap.event
+        def on_closed():
+            pass
+
+        cap.start_free_threaded()
+        self._capture = cap
+
+    # ── Backend 2: mss fallback (cursor will be in footage) ────
+    def _start_mss(self, region):
+        def loop():
+            iv = 1.0 / self.fps
+            with mss.mss() as sct:
+                while self.running:
+                    t_loop = time.perf_counter()
+                    img = np.asarray(sct.grab(region))  # BGRA
+                    self._write_frame(img)
+                    rem = iv - (time.perf_counter() - t_loop)
+                    if rem > 0:
+                        time.sleep(rem)
+        self._cap_thread = threading.Thread(target=loop, daemon=True)
+        self._cap_thread.start()
+
+    # ── Public API ─────────────────────────────────────────────
+    def start(self, region, bundle_dir):
+        self.bundle_path = bundle_dir
+        os.makedirs(bundle_dir, exist_ok=True)
+        raw_path = os.path.join(bundle_dir, "raw.mkv")
+        w, h = region["width"], region["height"]
+
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "rawvideo", "-vcodec", "rawvideo",
+            "-s", f"{w}x{h}", "-pix_fmt", "bgra",
+            "-r", str(self.fps), "-i", "pipe:0",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+            "-pix_fmt", "yuv420p", raw_path,
+        ]
+        try:
+            self._ffmpeg = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except FileNotFoundError:
+            raise RuntimeError("ffmpeg not found on PATH")
+
+        self._events.clear()
+        self._frame_idx = 0
+        self._last_write = -1.0
+        self._region = region
+        self._t0 = time.perf_counter()
         self.running = True
-        threading.Thread(target=self._loop, daemon=True).start()
+
+        if HAS_WGC:
+            self._start_wgc(region)
+        else:
+            self._start_mss(region)
+
         self._listener = pmouse.Listener(
             on_move=self._on_move,
             on_click=self._on_click,
@@ -421,11 +526,39 @@ class Recorder:
 
     def stop(self):
         self.running = False
-        if self._listener: self._listener.stop()
+        if self._listener:
+            try: self._listener.stop()
+            except Exception: pass
+        if self._capture:
+            try: self._capture.stop()
+            except Exception: pass
+        if self._cap_thread:
+            self._cap_thread.join(timeout=2.0)
+        if self._ffmpeg:
+            try: self._ffmpeg.stdin.close()
+            except Exception: pass
+            try: self._ffmpeg.wait(timeout=15)
+            except subprocess.TimeoutExpired: self._ffmpeg.kill()
 
-    def data(self):
+        # Persist event + meta tracks alongside raw.mkv
         with self._lock:
-            return list(self.frames), list(self.events)
+            events_out = [
+                {"t": t, "type": et, "x": x, "y": y}
+                for (t, et, x, y) in self._events
+            ]
+        with open(os.path.join(self.bundle_path, "events.json"), "w") as f:
+            json.dump(events_out, f)
+        with open(os.path.join(self.bundle_path, "meta.json"), "w") as f:
+            json.dump({
+                "version": VERSION,
+                "fps": self.fps,
+                "region": self._region,
+                "frame_count": self._frame_idx,
+                "duration": self._now(),
+                "cursor_excluded": HAS_WGC,
+                "backend": "windows-capture" if HAS_WGC else "mss",
+            }, f, indent=2)
+        return self.bundle_path
 
 
 # ============================================================
@@ -439,11 +572,27 @@ class Processor:
     def prog(self, pct, msg):
         if self.cb: self.cb(pct, msg)
 
-    def run(self, frames, events, out_path):
-        if not frames: return False
+    def run(self, bundle_dir, out_path):
+        # Load bundle
+        try:
+            with open(os.path.join(bundle_dir, "meta.json")) as f:
+                meta = json.load(f)
+            with open(os.path.join(bundle_dir, "events.json")) as f:
+                events_raw = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            self.prog(0, f"Bad bundle: {e}"); return False
+
+        raw_path = os.path.join(bundle_dir, "raw.mkv")
+        src = cv2.VideoCapture(raw_path)
+        if not src.isOpened():
+            self.prog(0, "Failed to open raw.mkv"); return False
+
+        # Event dicts → (t, type, x, y) tuples for downstream code
+        events = [(e["t"], e["type"], e["x"], e["y"]) for e in events_raw]
+
         s   = self.s
-        fps = s["fps"]
-        reg = s["region"]
+        fps = meta.get("fps", s["fps"])
+        reg = meta.get("region") or s["region"]
         sw, sh = reg["width"], reg["height"]
 
         preset = s["canvas_preset"]
@@ -506,16 +655,17 @@ class Processor:
         sorted_ev = sorted(events, key=lambda e:e[0])
         ev_i     = 0
         cur_x, cur_y = sw//2, sh//2
-        n = len(frames)
-        t0 = frames[0][0]
+        n = meta.get("frame_count") or int(src.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
         cur_opacity = 1.0
         idle_frames = 0
 
         self.prog(8, "Processing frames...")
-        print(f"[DEBUG] frames={n}, events={len(sorted_ev)}, clicks={len([e for e in sorted_ev if e[1]=='CLICK_L'])}")
-        print(f"[DEBUG] canvas={cw}x{ch}, source={sw}x{sh}, zoom_wins={len(zoom_wins)}")
 
-        for fi,(tf,frame) in enumerate(frames):
+        fi = 0
+        while True:
+            ok, frame = src.read()
+            if not ok: break
+            tf = fi / fps   # frame time relative to record start (shared clock with events)
 
             # Advance events
             while ev_i < len(sorted_ev) and sorted_ev[ev_i][0] <= tf:
@@ -629,7 +779,9 @@ class Processor:
             if fi%15==0:
                 self.prog(8+int((fi/n)*87),
                           f"Frame {fi+1}/{n}  ({int(fi/n*100)}%)")
+            fi += 1
 
+        src.release()
         proc.stdin.close()
         proc.wait()
         self.prog(100,"Done!")
@@ -649,8 +801,7 @@ class App(ctk.CTk):
 
         self.recorder = Recorder()
         self.recording = False
-        self.frames  = []
-        self.events  = []
+        self.bundle_path = None
         self.bg_type = "gradient"
         self.bg_val  = GRADIENTS[0]
         self._rec_start = 0.0
@@ -949,55 +1100,74 @@ class App(ctk.CTk):
     # ── Recording
     def toggle_recording(self):
         if not self.recording:
-            self.frames.clear(); self.events.clear()
+            self.bundle_path = os.path.join(
+                tempfile.gettempdir(),
+                f"screensee_{int(time.time())}.screensee")
             self.recording = True
-            self._rec_start = time.time()
+            self._rec_start = time.perf_counter()
             region = {"left":0,"top":0,"width":self.sw,"height":self.sh}
-            self.recorder.start(region)
+            self.recorder = Recorder(fps=int(self.fps_var.get()))
+            try:
+                self.recorder.start(region, self.bundle_path)
+            except RuntimeError as e:
+                messagebox.showerror("Recorder", str(e))
+                self.recording = False
+                return
+            backend_msg = "Recording (cursor excluded)" if HAS_WGC else "Recording (mss — cursor will be in footage)"
             self.rec_btn.configure(text="Stop Recording",
                                     fg_color="#ef4444",
                                     hover_color="#dc2626")
             self.exp_btn.configure(state="disabled", fg_color="#1e2d4a")
             self.prev_btn.configure(state="disabled", fg_color="#1e2d4a")
-            self.status_var.set("Recording...")
+            self.status_var.set(backend_msg)
             self.status_lbl.configure(text_color="#22c55e")
             self._tick()
         else:
             self.recording = False
             self.recorder.stop()
-            self.frames, self.events = self.recorder.data()
             self.rec_btn.configure(text="Start Recording",
                                     fg_color="#22c55e",
                                     hover_color="#16a34a")
             self.exp_btn.configure(state="normal", fg_color="#6366f1")
             self.prev_btn.configure(state="normal", fg_color="#1e2d4a")
-            self.status_var.set(
-                f"Done — {len(self.frames)} frames  •  {len(self.events)} events")
+            try:
+                meta_path = os.path.join(self.bundle_path, "meta.json")
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                self.status_var.set(
+                    f"Done — {meta['frame_count']} frames  •  "
+                    f"{meta['duration']:.1f}s  •  bundle: {self.bundle_path}")
+            except Exception:
+                self.status_var.set(f"Done — bundle: {self.bundle_path}")
             self.status_lbl.configure(text_color="#475569")
 
     def _tick(self):
         if self.recording:
-            e = time.time()-self._rec_start
+            e = time.perf_counter()-self._rec_start
             self.timer_var.set(
                 f"{int(e//60):02d}:{int(e%60):02d}.{int((e%1)*1000):03d}")
             self.after(33, self._tick)
 
     # ── Export
     def export_mp4(self):
+        if not self.bundle_path or not os.path.isdir(self.bundle_path):
+            messagebox.showinfo("No Recording","Record first then export.")
+            return
         out = filedialog.asksaveasfilename(
             defaultextension=".mp4",
             filetypes=[("MP4","*.mp4")],
             initialfile="screensee.mp4")
         if not out: return
         s = self._settings()
+        bundle = self.bundle_path
         def run():
             p = Processor(s, progress_cb=self._on_progress)
-            ok = p.run(self.frames, self.events, out)
+            ok = p.run(bundle, out)
             if ok:
                 messagebox.showinfo("Exported!",f"Saved:\n{out}")
             else:
                 messagebox.showerror("Error",
-                    "Export failed.\nInstall FFmpeg from ffmpeg.org\nand add it to PATH.")
+                    "Export failed.\nCheck that FFmpeg is on PATH and the bundle is valid.")
         threading.Thread(target=run, daemon=True).start()
 
     def _on_progress(self, pct, msg):
@@ -1006,14 +1176,23 @@ class App(ctk.CTk):
 
     # ── Preview
     def open_preview(self):
-        if not self.frames:
+        if not self.bundle_path or not os.path.isdir(self.bundle_path):
             messagebox.showinfo("No Data","Record first then preview.")
             return
+
+        raw_path = os.path.join(self.bundle_path, "raw.mkv")
+        src = cv2.VideoCapture(raw_path)
+        if not src.isOpened():
+            messagebox.showerror("Preview", f"Failed to open {raw_path}")
+            return
+        total = int(src.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
 
         win = ctk.CTkToplevel(self)
         win.title("Live Preview")
         win.geometry("720x520")
         win.configure(fg_color="#0d1117")
+        win.protocol("WM_DELETE_WINDOW",
+                     lambda: (src.release(), win.destroy()))
 
         PREV_W, PREV_H = 680, 380
 
@@ -1031,9 +1210,9 @@ class App(ctk.CTk):
         ctk.CTkLabel(scr_row, text="Frame",
                      font=ctk.CTkFont("Segoe UI",10),
                      text_color="#94a3b8").pack(side="left")
-        frame_var = ctk.IntVar(value=min(30,len(self.frames)-1))
+        frame_var = ctk.IntVar(value=min(30, total-1))
         scr = ctk.CTkSlider(scr_row,
-                             from_=0, to=max(1,len(self.frames)-1),
+                             from_=0, to=max(1, total-1),
                              variable=frame_var, width=560,
                              button_color="#6366f1",
                              button_hover_color="#8b5cf6",
@@ -1043,7 +1222,8 @@ class App(ctk.CTk):
         ctk.CTkButton(win, text="Close",
                       width=100, height=32,
                       fg_color="#1e2d4a", hover_color="#6366f1",
-                      command=win.destroy).pack(pady=(0,10))
+                      command=lambda: (src.release(), win.destroy())
+                      ).pack(pady=(0,10))
 
         win._img = None
         win._last = None
@@ -1056,7 +1236,9 @@ class App(ctk.CTk):
             if key == win._last: return
             win._last = key
 
-            _,f = self.frames[fi]
+            src.set(cv2.CAP_PROP_POS_FRAMES, fi)
+            ok, f = src.read()
+            if not ok: return
             img = Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGBA))
             preset = s["canvas_preset"]
             if preset and preset != "Original":

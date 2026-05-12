@@ -1,0 +1,12 @@
+# Core
+customtkinter>=5.2
+opencv-python>=4.8
+Pillow>=10.0
+numpy>=1.24
+pynput>=1.7
+mss>=9.0
+
+# Windows-only: enables true cursor exclusion in capture.
+# On non-Windows or if install fails, ScreenSee falls back to mss
+# (cursor will appear in the raw footage).
+windows-capture>=1.0 ; sys_platform == "win32"
