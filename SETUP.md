@@ -129,11 +129,18 @@ This pulls in:
 | `numpy`           | Frame buffers                               |
 | `pynput`          | Mouse + click event capture                 |
 | `mss`             | Software screen capture (fallback)          |
+| `cairosvg`        | Rasterises the SVG cursors in `cursors/`    |
 | `windows-capture` | GPU screen capture, cursor exclusion (Win)  |
 
 If `windows-capture` fails to install (older Windows builds
 sometimes do), don't panic — ScreenSee detects that and falls back
 to `mss`. Recording will still work; capture is just CPU-based.
+
+If `cairosvg` fails to install (it bundles its own copy of
+libcairo, but very old pip versions occasionally miss it), the SVG
+cursor sprites under `cursors/` won't be available and ScreenSee
+falls back to procedural polygon cursors. Recording and export are
+unaffected; you just lose the realistic cursor art.
 
 ---
 

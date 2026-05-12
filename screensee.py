@@ -34,11 +34,24 @@ try:
 except ImportError:
     HAS_WGC = False
 
+# Optional SVG rasteriser for the cursor sprites under cursors/.
+# If cairosvg isn't installed we fall back to the procedural polygon
+# cursor styles so the app still runs.
+try:
+    import cairosvg
+    from io import BytesIO
+    HAS_CAIROSVG = True
+except ImportError:
+    HAS_CAIROSVG = False
+
+CURSORS_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "cursors")
+
 # ── Theme
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-VERSION  = "3.8"
+VERSION  = "3.9"
 APP_NAME = "ScreenSee"
 
 CANVAS_PRESETS = {
@@ -276,28 +289,66 @@ HAND_PTS = [(11,0),(15,0),(15,10),(20,10),(22,12),(22,28),
             (4,10),(11,10)]
 
 CURSOR_STYLES = {
-    # Polygon cursors: tip anchored near sprite (0,0) -> tip lands on (cx,cy).
-    "arrow":    {"kind": "polygon", "pts": ARROW_PTS,
-                 "fill": (255,255,255), "outline": (0,0,0),
-                 "tip": (0, 0)},
-    "modern":   {"kind": "polygon",
-                 "pts": [(0,0),(0,22),(7,17),(11,28),(15,26),
-                         (10,15),(18,15)],
-                 "fill": (250,250,255), "outline": (40,40,55),
-                 "tip": (0, 0)},
-    "triangle": {"kind": "polygon",
-                 "pts": [(0,0),(22,11),(0,22)],
-                 "fill": (255,255,255), "outline": (0,0,0),
-                 "tip": (0, 11)},
-    "hand":     {"kind": "polygon", "pts": HAND_PTS,
-                 "fill": (255,235,220), "outline": (60,40,30),
-                 "tip": (12, 0)},
-    # Centered cursors: anchor at sprite centre, useful as a minimal dot.
-    "dot":      {"kind": "circle", "diameter": 16,
-                 "fill": (240,240,255), "outline": (255,255,255)},
-    "ring":     {"kind": "ring",   "diameter": 22,
-                 "outline": (255,255,255), "width": 3},
+    # SVG cursors under cursors/. Tip = normalised (x, y) within the
+    # sprite bounding box where the cursor "hotspot" sits — that pixel
+    # is anchored to (cx, cy) when drawn.
+    "arrow":      {"kind": "svg", "file": "cursor.svg",
+                   "tip": (0.30, 0.18)},     # upper-left of arrow head
+    "pointer":    {"kind": "svg", "file": "pointinghand.svg",
+                   "tip": (0.45, 0.06)},     # tip of pointing finger
+    "openhand":   {"kind": "svg", "file": "openhand.svg",
+                   "tip": (0.50, 0.30)},     # middle finger tip area
+    "closedhand": {"kind": "svg", "file": "closedhand.svg",
+                   "tip": (0.50, 0.40)},     # centre of fist
+    "text":       {"kind": "svg", "file": "textcursor.svg",
+                   "tip": (0.50, 0.50)},     # I-beam centre
+
+    # Polygon fallbacks. Always available, used if a chosen SVG cursor
+    # can't be rasterised (cairosvg missing, file missing, etc.).
+    "arrow_poly": {"kind": "polygon", "pts": ARROW_PTS,
+                   "fill": (255,255,255), "outline": (0,0,0),
+                   "tip": (0, 0)},
+    "modern":     {"kind": "polygon",
+                   "pts": [(0,0),(0,22),(7,17),(11,28),(15,26),
+                           (10,15),(18,15)],
+                   "fill": (250,250,255), "outline": (40,40,55),
+                   "tip": (0, 0)},
+    "triangle":   {"kind": "polygon",
+                   "pts": [(0,0),(22,11),(0,22)],
+                   "fill": (255,255,255), "outline": (0,0,0),
+                   "tip": (0, 11)},
+    "dot":        {"kind": "circle", "diameter": 16,
+                   "fill": (240,240,255), "outline": (255,255,255)},
+    "ring":       {"kind": "ring",   "diameter": 22,
+                   "outline": (255,255,255), "width": 3},
 }
+
+
+# (file_name, target_height) -> rasterised PIL Image. Cursor sprites are
+# tiny and there are only a few sizes in flight, so a plain dict is
+# fine — no need for an LRU.
+_SVG_SPRITE_CACHE = {}
+
+def _load_svg_sprite(file_name, target_h):
+    """Rasterise a cursor SVG to a PIL RGBA Image at the requested
+    height. Returns None if cairosvg is unavailable or the file is
+    missing — caller is expected to fall back to a polygon style."""
+    if not HAS_CAIROSVG:
+        return None
+    key = (file_name, target_h)
+    cached = _SVG_SPRITE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    path = os.path.join(CURSORS_DIR, file_name)
+    if not os.path.isfile(path):
+        return None
+    try:
+        png_bytes = cairosvg.svg2png(url=path, output_height=target_h)
+        img = Image.open(BytesIO(png_bytes)).convert("RGBA")
+    except Exception:
+        return None
+    _SVG_SPRITE_CACHE[key] = img
+    return img
 
 
 def _draw_sprite(style, scale, opacity):
@@ -305,11 +356,30 @@ def _draw_sprite(style, scale, opacity):
     Returns (sprite, anchor_x, anchor_y) where anchor is the sprite
     pixel that should land on (cx, cy)."""
     cdef = CURSOR_STYLES.get(style, CURSOR_STYLES["arrow"])
+    kind = cdef["kind"]
+
+    if kind == "svg":
+        # Target a sprite height of roughly the cursor 'size' (passed in
+        # as scale = size/32) but raster a bit larger and Lanczos-shrink
+        # so antialiased edges hold up when the source frame is later
+        # downscaled into the canvas.
+        target_h = max(8, int(32 * scale))
+        sprite = _load_svg_sprite(cdef["file"], target_h * 2)
+        if sprite is None:
+            # Fall back to the polygon arrow so the cursor never disappears.
+            return _draw_sprite("arrow_poly", scale, opacity)
+        sprite = sprite.resize((sprite.width // 2, sprite.height // 2),
+                                Image.LANCZOS)
+        if opacity < 1.0:
+            a = sprite.split()[-1].point(lambda v: int(v * opacity))
+            sprite.putalpha(a)
+        tip_nx, tip_ny = cdef["tip"]
+        return sprite, int(tip_nx * sprite.width), int(tip_ny * sprite.height)
+
     box = int(64 * scale)
     cur = Image.new("RGBA", (box, box), (0, 0, 0, 0))
     d   = ImageDraw.Draw(cur)
 
-    kind = cdef["kind"]
     if kind == "polygon":
         pts = cdef["pts"]
         fill    = cdef["fill"]
@@ -349,10 +419,11 @@ def draw_cursor(img_rgba, cx, cy, size=32, opacity=1.0, tilt=0.0,
                 pressed=False, dragging=False, style="arrow"):
     # `tilt` is accepted for back-compat but intentionally ignored.
     scale = size / 32.0
-    # When dragging the user expects something that reads as "grabbing"
-    # rather than the default pointer. Swap to the hand silhouette
-    # automatically; the per-frame state already tells us this.
-    eff_style = "hand" if dragging else style
+    # Automatic state swap: while a drag is in flight (button held +
+    # cursor moving) Screen-Studio-style recorders show a closed fist.
+    # closedhand SVG when available, else falls through to whatever
+    # the user picked.
+    eff_style = "closedhand" if dragging else style
     cur, ax, ay = _draw_sprite(eff_style, scale, opacity)
     img_rgba.paste(cur, (int(cx) - ax, int(cy) - ay), cur)
 
@@ -1167,7 +1238,8 @@ class App(ctk.CTk):
         self.loop_cursor_var  = ctk.BooleanVar(value=False)
         self.autozoom_var     = ctk.BooleanVar(value=True)
         self.zoomlevel_var    = ctk.DoubleVar(value=2.0)
-        self.cursor_style_var = ctk.StringVar(value="arrow")
+        self.cursor_style_var = ctk.StringVar(
+            value="arrow" if HAS_CAIROSVG else "arrow_poly")
         self.bg_tab_var       = ctk.StringVar(value="Gradient")
 
         for v in (self.canvas_var, self.padding_var, self.roundness_var,
@@ -1490,7 +1562,17 @@ class App(ctk.CTk):
         style_row.pack(fill="x", padx=14, pady=(2, 6))
         self._cursor_style_btns = {}
         self._cursor_style_imgs = {}     # keep PhotoImage refs alive
-        for name in ("arrow", "modern", "triangle", "hand", "dot", "ring"):
+        # SVG-backed cursors first (the realistic ones the user shipped).
+        # If cairosvg failed to import the SVGs can't render — drop them
+        # from the picker so every slot doesn't show the same fallback
+        # arrow.
+        if HAS_CAIROSVG:
+            picker_styles = ["arrow", "pointer", "openhand",
+                              "closedhand", "text"]
+        else:
+            picker_styles = ["arrow_poly"]
+        picker_styles += ["modern", "triangle", "dot", "ring"]
+        for name in picker_styles:
             sprite, _, _ = _draw_sprite(name, 1.0, 1.0)
             sprite = sprite.crop(sprite.getbbox() or (0, 0, 32, 32))
             sprite.thumbnail((26, 26), Image.LANCZOS)
