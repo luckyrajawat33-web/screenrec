@@ -38,7 +38,7 @@ except ImportError:
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-VERSION  = "3.1"
+VERSION  = "3.2"
 APP_NAME = "ScreenSee"
 
 CANVAS_PRESETS = {
@@ -272,6 +272,9 @@ ARROW_SHADOW = [(x+2,y+3) for x,y in ARROW_PTS]
 
 def draw_cursor(img_rgba, cx, cy, size=32, opacity=1.0, tilt=0.0,
                 pressed=False, dragging=False):
+    # `tilt` is accepted for back-compat but intentionally ignored:
+    # rotating the sprite around its centre moves the tip away from
+    # (cx, cy) and produces the visible "bending" that v3.1 had.
     scale = size / 32.0
     scaled   = [(int(x*scale), int(y*scale)) for x,y in ARROW_PTS]
     shadow_p = [(int(x*scale), int(y*scale)) for x,y in ARROW_SHADOW]
@@ -281,12 +284,10 @@ def draw_cursor(img_rgba, cx, cy, size=32, opacity=1.0, tilt=0.0,
     d.polygon(scaled,   fill=(255,255,255,int(255*opacity)))
     d.line([scaled[i] for i in range(len(scaled))] + [scaled[0]],
            fill=(0,0,0,int(200*opacity)), width=max(1,int(1.5*scale)))
-    if abs(tilt) > 0.5:
-        cur = cur.rotate(-tilt, resample=Image.BICUBIC, expand=False)
-    ix, iy = int(cx)-2, int(cy)-2
-    img_rgba.paste(cur, (ix, iy), cur)
+    # Sprite tip lives at sprite (0,0); the small -2 offset accounts for
+    # the antialiased outline so the visible tip lands on (cx, cy).
+    img_rgba.paste(cur, (int(cx)-2, int(cy)-2), cur)
 
-    # Click highlight ring — drawn on the destination, anchored at the tip.
     if pressed and opacity > 0.02:
         ring_r = int(14 * scale * (1.4 if dragging else 1.0))
         ring_a = int((140 if dragging else 200) * opacity)
@@ -404,10 +405,14 @@ def composite(rec_pil, cw, ch, bg_type, bg_val,
 def precompute_track(events, meta, s):
     """Walk through every frame once, producing the cursor/zoom state.
     Returns list[dict] indexed by frame number. Cheap (~ms per 1k frames)."""
-    fps = meta["fps"]
-    n   = meta.get("frame_count") or 0
-    reg = meta["region"]
+    fps    = meta["fps"]
+    n      = meta.get("frame_count") or 0
+    reg    = meta["region"]
     sw, sh = reg["width"], reg["height"]
+    # Per-frame content time. Falls back to fi/fps for older bundles, but
+    # using the recorded times avoids the half-frame-ish drift between
+    # capture delivery and "frame N is at N/fps".
+    ftimes = meta.get("frame_times") or [fi / fps for fi in range(n)]
     if n <= 0:
         return []
 
@@ -446,7 +451,7 @@ def precompute_track(events, meta, s):
     fired_rips  = []   # list of (t_start, x, y)
 
     for fi in range(n):
-        tf = fi / fps
+        tf = ftimes[fi] if fi < len(ftimes) else fi / fps
         while ev_i < len(evs) and evs[ev_i][0] <= tf:
             t, et, ex, ey = evs[ev_i]
             if et == "MOVE":
@@ -597,6 +602,7 @@ class Recorder:
         self.running     = False
         self._events     = []           # only input events live in RAM
         self._frame_idx  = 0
+        self._frame_times = []          # content-time per kept frame
         self._last_write = -1.0
         self._region     = None
         self._t0         = 0.0
@@ -629,14 +635,18 @@ class Recorder:
                 self._events.append((self._now(), f"SCROLL_{d}", x, y))
 
     # ── Frame write (called from capture backend) ──────────────
-    def _write_frame(self, bgra):
-        # Decimate to target fps; capture backend may deliver at monitor refresh.
-        now = self._now()
-        if now - self._last_write < (1.0 / self.fps) - 0.001:
+    def _write_frame(self, bgra, content_t=None):
+        # Decimate to target fps. content_t is when the *pixels* were captured,
+        # which may be earlier than _now() because of grab/decode latency. We
+        # stamp the bundle with content_t so the processor can align events
+        # to the exact frame they belong on.
+        t = self._now() if content_t is None else content_t
+        if t - self._last_write < (1.0 / self.fps) - 0.001:
             return
-        self._last_write = now
+        self._last_write = t
         try:
             self._ffmpeg.stdin.write(bgra.tobytes())
+            self._frame_times.append(t)
             self._frame_idx += 1
         except (BrokenPipeError, OSError, ValueError):
             self.running = False
@@ -655,10 +665,11 @@ class Recorder:
         def on_frame_arrived(frame: "Frame", ctrl: "InternalCaptureControl"):
             if not self.running:
                 ctrl.stop(); return
+            t_arrived = self._now()
             buf = frame.frame_buffer  # HxWx4 BGRA
             if (buf.shape[1], buf.shape[0]) != (w, h):
                 buf = buf[t:t+h, l:l+w]
-            self._write_frame(buf)
+            self._write_frame(buf, content_t=t_arrived)
 
         @cap.event
         def on_closed():
@@ -673,9 +684,12 @@ class Recorder:
             iv = 1.0 / self.fps
             with mss.mss() as sct:
                 while self.running:
-                    t_loop = time.perf_counter()
+                    # Stamp content time at the start of the grab — this is
+                    # the moment the screen pixels actually represent.
+                    t_capture = self._now()
+                    t_loop    = time.perf_counter()
                     img = np.asarray(sct.grab(region))  # BGRA
-                    self._write_frame(img)
+                    self._write_frame(img, content_t=t_capture)
                     rem = iv - (time.perf_counter() - t_loop)
                     if rem > 0:
                         time.sleep(rem)
@@ -705,6 +719,7 @@ class Recorder:
             raise RuntimeError("ffmpeg not found on PATH")
 
         self._events.clear()
+        self._frame_times.clear()
         self._frame_idx = 0
         self._last_write = -1.0
         self._region = region
@@ -752,10 +767,11 @@ class Recorder:
                 "fps": self.fps,
                 "region": self._region,
                 "frame_count": self._frame_idx,
+                "frame_times": self._frame_times,
                 "duration": self._now(),
                 "cursor_excluded": HAS_WGC,
                 "backend": "windows-capture" if HAS_WGC else "mss",
-            }, f, indent=2)
+            }, f)
         return self.bundle_path
 
 
@@ -889,7 +905,7 @@ class App(ctk.CTk):
 
         # Hidden defaults (controls dropped from UI)
         self._inset       = 0
-        self._cursor_tilt = True
+        self._cursor_tilt = False   # rotation moves the tip off-target
         self._auto_hide   = True
         self._zoom_dur    = 1.5
 
@@ -921,7 +937,7 @@ class App(ctk.CTk):
         self.roundness_var    = ctk.DoubleVar(value=14)
         self.shadow_var       = ctk.DoubleVar(value=70)
         self.cursor_size_var  = ctk.DoubleVar(value=36)
-        self.smooth_var       = ctk.DoubleVar(value=0.7)
+        self.smooth_var       = ctk.DoubleVar(value=0.35)
         self.ripple_var       = ctk.BooleanVar(value=True)
         self.autozoom_var     = ctk.BooleanVar(value=True)
         self.zoomlevel_var    = ctk.DoubleVar(value=2.0)
@@ -1019,11 +1035,30 @@ class App(ctk.CTk):
                 font=ctk.CTkFont("Segoe UI", 12),
                 text_color=self.FG).pack(side="left", padx=8)
 
-        info = (f"Display: {self.sw} × {self.sh}     "
-                f"Backend: {'WGC (cursor excluded)' if HAS_WGC else 'mss (cursor in footage)'}")
-        ctk.CTkLabel(center, text=info,
+        ctk.CTkLabel(center, text=f"Display: {self.sw} × {self.sh}",
                      font=ctk.CTkFont("Segoe UI", 10),
-                     text_color="#5e5e75").pack(pady=(36, 0))
+                     text_color="#5e5e75").pack(pady=(36, 6))
+
+        # Backend chip — amber when on mss because the OS cursor will be
+        # baked into the raw footage and you'll see two cursors in preview.
+        chip_frame = ctk.CTkFrame(center, fg_color=self.PANEL_2,
+                                   corner_radius=6)
+        chip_frame.pack()
+        if HAS_WGC:
+            ctk.CTkLabel(
+                chip_frame, text="● Capture: WGC  (cursor excluded)",
+                font=ctk.CTkFont("Segoe UI", 10, weight="bold"),
+                text_color="#22c55e",
+            ).pack(padx=12, pady=4)
+        else:
+            ctk.CTkLabel(
+                chip_frame,
+                text=("⚠  Capture: mss fallback — OS cursor will be in the "
+                      "raw footage (you'll see two cursors).\n"
+                      "Run:  pip install windows-capture"),
+                font=ctk.CTkFont("Segoe UI", 10, weight="bold"),
+                text_color="#f59e0b", justify="left",
+            ).pack(padx=12, pady=6)
 
         self.welcome_status = ctk.CTkLabel(
             center, text="",
@@ -1225,6 +1260,12 @@ class App(ctk.CTk):
     # ── settings dict (single source of truth for render+export)
     def _settings(self):
         smooth = float(self.smooth_var.get())
+        # Map Smoothness 0..1 to absolute FocuSee-style spring constants.
+        # 0 → k=470 (FocuSee default, snappy)   1 → k=120 (very gentle).
+        # Damping is always 0.92 of critical so the cursor catches up
+        # quickly without ringing.
+        k = 470.0 - smooth * 350.0
+        b = 2.0 * math.sqrt(k * 3.0) * 0.92
         return {
             "fps":           int(self.fps_var.get()),
             "region":        {"left": 0, "top": 0,
@@ -1237,8 +1278,8 @@ class App(ctk.CTk):
             "bg_type":       self.bg_type,
             "bg_val":        self.bg_val,
             "cursor_size":   int(self.cursor_size_var.get()),
-            "stiffness":     0.05 + (1.0 - smooth) * 0.45,
-            "damping":       0.55 + smooth * 0.30,
+            "stiffness":     k / 1200.0,    # downstream multiplies back
+            "damping":       b / 90.0,
             "cursor_tilt":   self._cursor_tilt,
             "click_ripple":  self.ripple_var.get(),
             "auto_hide":     self._auto_hide,
