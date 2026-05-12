@@ -38,7 +38,7 @@ except ImportError:
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-VERSION  = "3.5"
+VERSION  = "3.6"
 APP_NAME = "ScreenSee"
 
 CANVAS_PRESETS = {
@@ -199,7 +199,7 @@ class ZoomEngine:
         t = max(0.0, min(1.0, t))
         return t * t * t
 
-    def trigger(self, nx, ny, z=2.0, t=None, in_dur=0.5):
+    def trigger(self, nx, ny, z=2.0, t=None, in_dur=1.0):
         """Zoom in — only starts new animation if target changed"""
         if (self._target_zoom == z and
             abs(self._target_cx - nx) < 0.01 and
@@ -217,7 +217,7 @@ class ZoomEngine:
         self._target_cx   = nx
         self._target_cy   = ny
 
-    def release(self, t=None, out_dur=0.8):
+    def release(self, t=None, out_dur=1.4):
         """Zoom out — only starts new animation if not already zooming out"""
         if self._target_zoom <= 1.02:
             return  # already released or releasing
@@ -421,10 +421,12 @@ def precompute_track(events, meta, s):
         damping  =s["damping"]*90.0,
         mass=3.0, fps=fps)
     zoom_eng = ZoomEngine(fps=fps)
-    # Separate, gentler spring for the zoom-camera centre. FocuSee's
-    # screenMovementSpring constants — overdamped, ~0.5s settle — so the
-    # camera slowly follows the cursor instead of locking to the click.
-    screen = MassSpringDamper(stiffness=170.0, damping=50.0,
+    # Separate, gentler spring for the zoom-camera centre. Tuned for a
+    # Screen-Studio-style premium pan: ~1 s to settle, slightly
+    # overdamped so there is no overshoot at the end of a fast cursor
+    # move. (FocuSee's defaults were k=170/b=50; the camera felt snappy
+    # by comparison.)
+    screen = MassSpringDamper(stiffness=50.0, damping=25.7,
                               mass=3.0, fps=fps)
 
     evs = sorted([
@@ -571,7 +573,7 @@ def render_frame(raw_bgr, st, s, sw, sh, cw, ch):
             rd.ellipse([rxd-rad, ryd-rad, rxd+rad, ryd+rad],
                        outline=(100, 150, 255, alpha), width=2)
 
-    if st["opacity"] > 0.02:
+    if st["opacity"] > 0.02 and s.get("show_cursor", True):
         draw_cursor(img, draw_sx, draw_sy,
                     size=s["cursor_size"], opacity=st["opacity"],
                     tilt=st["tilt"],
@@ -944,7 +946,9 @@ class App(ctk.CTk):
         self._inset       = 0
         self._cursor_tilt = False   # rotation moves the tip off-target
         self._auto_hide   = True
-        self._zoom_dur    = 1.5
+        # Hold ~1 s at peak zoom AFTER the 1 s ease-in, so a click looks
+        # like: 1 s zoom in → 1 s held → 1.4 s ease out.
+        self._zoom_dur    = 2.0
 
         # Detect display
         try:
@@ -976,12 +980,14 @@ class App(ctk.CTk):
         self.cursor_size_var  = ctk.DoubleVar(value=36)
         self.smooth_var       = ctk.DoubleVar(value=0.35)
         self.ripple_var       = ctk.BooleanVar(value=True)
+        self.show_cursor_var  = ctk.BooleanVar(value=True)
         self.autozoom_var     = ctk.BooleanVar(value=True)
         self.zoomlevel_var    = ctk.DoubleVar(value=2.0)
 
         for v in (self.canvas_var, self.padding_var, self.roundness_var,
                   self.shadow_var, self.cursor_size_var, self.smooth_var,
-                  self.ripple_var, self.autozoom_var, self.zoomlevel_var):
+                  self.ripple_var, self.show_cursor_var,
+                  self.autozoom_var, self.zoomlevel_var):
             v.trace_add("write", lambda *a: self._request_render())
 
     # ── small helpers ──────────────────────────────────────────
@@ -1259,6 +1265,7 @@ class App(ctk.CTk):
 
         # CURSOR
         self._section(parent, "CURSOR")
+        self._toggle(parent, "Cursor overlay", self.show_cursor_var)
         self._slider(parent, "Size",       self.cursor_size_var, 16, 64)
         self._slider(parent, "Smoothness", self.smooth_var, 0.0, 1.0,
                      fmt=lambda v: f"{float(v):.2f}")
@@ -1318,6 +1325,7 @@ class App(ctk.CTk):
             "stiffness":     k / 1200.0,    # downstream multiplies back
             "damping":       b / 90.0,
             "cursor_tilt":   self._cursor_tilt,
+            "show_cursor":   self.show_cursor_var.get(),
             "click_ripple":  self.ripple_var.get(),
             "auto_hide":     self._auto_hide,
             "auto_zoom":     self.autozoom_var.get(),
@@ -1440,6 +1448,13 @@ class App(ctk.CTk):
         self.scrub.configure(to=max(1, self._total - 1))
         self._programmatic = True
         self.scrub_var.set(0)
+        # When the bundle came from the mss backend, the OS cursor is
+        # already baked into raw.mkv. Drawing the synthetic cursor on top
+        # produces a visibly lagging double-cursor — default the overlay
+        # off so the real cursor is what the user sees. They can flip it
+        # back on in the sidebar.
+        backend = self._meta.get("backend", "")
+        self.show_cursor_var.set(backend != "mss")
         self._programmatic = False
         self._track_key = None
         self._request_render()
