@@ -38,7 +38,7 @@ except ImportError:
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-VERSION  = "3.0"
+VERSION  = "3.1"
 APP_NAME = "ScreenSee"
 
 CANVAS_PRESETS = {
@@ -270,7 +270,8 @@ class ZoomEngine:
 ARROW_PTS = [(0,0),(0,28),(7,21),(12,32),(16,30),(11,19),(20,19)]
 ARROW_SHADOW = [(x+2,y+3) for x,y in ARROW_PTS]
 
-def draw_cursor(img_rgba, cx, cy, size=32, opacity=1.0, tilt=0.0):
+def draw_cursor(img_rgba, cx, cy, size=32, opacity=1.0, tilt=0.0,
+                pressed=False, dragging=False):
     scale = size / 32.0
     scaled   = [(int(x*scale), int(y*scale)) for x,y in ARROW_PTS]
     shadow_p = [(int(x*scale), int(y*scale)) for x,y in ARROW_SHADOW]
@@ -284,6 +285,21 @@ def draw_cursor(img_rgba, cx, cy, size=32, opacity=1.0, tilt=0.0):
         cur = cur.rotate(-tilt, resample=Image.BICUBIC, expand=False)
     ix, iy = int(cx)-2, int(cy)-2
     img_rgba.paste(cur, (ix, iy), cur)
+
+    # Click highlight ring — drawn on the destination, anchored at the tip.
+    if pressed and opacity > 0.02:
+        ring_r = int(14 * scale * (1.4 if dragging else 1.0))
+        ring_a = int((140 if dragging else 200) * opacity)
+        ring_w = max(2, int(2 * scale))
+        rd = ImageDraw.Draw(img_rgba)
+        rd.ellipse([int(cx)-ring_r, int(cy)-ring_r,
+                    int(cx)+ring_r, int(cy)+ring_r],
+                   outline=(99, 102, 241, ring_a), width=ring_w)
+        if dragging:
+            inner_r = int(5 * scale)
+            rd.ellipse([int(cx)-inner_r, int(cy)-inner_r,
+                        int(cx)+inner_r, int(cy)+inner_r],
+                       fill=(99, 102, 241, int(110 * opacity)))
 
 
 # ============================================================
@@ -378,6 +394,188 @@ def composite(rec_pil, cw, ch, bg_type, bg_val,
 
     canvas.paste(rec_r,(rx,ry),rec_r)
     return canvas, rx, ry, ow, oh, sc
+
+
+# ============================================================
+#  ANIMATION TRACK + FRAME RENDER
+#  Shared between live preview and final export, so the preview
+#  shows exactly what will be exported.
+# ============================================================
+def precompute_track(events, meta, s):
+    """Walk through every frame once, producing the cursor/zoom state.
+    Returns list[dict] indexed by frame number. Cheap (~ms per 1k frames)."""
+    fps = meta["fps"]
+    n   = meta.get("frame_count") or 0
+    reg = meta["region"]
+    sw, sh = reg["width"], reg["height"]
+    if n <= 0:
+        return []
+
+    smoother = MassSpringDamper(
+        stiffness=s["stiffness"]*1200.0,
+        damping  =s["damping"]*90.0,
+        mass=3.0, fps=fps)
+    zoom_eng = ZoomEngine(fps=fps)
+
+    evs = sorted([
+        (e["t"], e["type"], e["x"]-reg["left"], e["y"]-reg["top"])
+        for e in events
+    ], key=lambda x: x[0])
+
+    clicks = [(t,x,y) for t,et,x,y in evs if et == "CLICK_L"]
+    zoom_wins = []
+    if s["auto_zoom"]:
+        for i,(t,cx,cy) in enumerate(clicks):
+            end = t + s["zoom_dur"]
+            if i+1 < len(clicks):
+                end = min(end, clicks[i+1][0]-0.05)
+            zoom_wins.append({
+                "s": t-0.05, "e": end,
+                "nx": cx/sw,  "ny": cy/sh,
+                "z":  s["zoom_level"],
+            })
+
+    track       = []
+    cur_x, cur_y = sw//2, sh//2
+    pressed     = False
+    last_press_t = -1.0
+    cur_opacity = 1.0
+    idle_frames = 0
+    ev_i        = 0
+    ripple_dur  = 0.45
+    fired_rips  = []   # list of (t_start, x, y)
+
+    for fi in range(n):
+        tf = fi / fps
+        while ev_i < len(evs) and evs[ev_i][0] <= tf:
+            t, et, ex, ey = evs[ev_i]
+            if et == "MOVE":
+                cur_x, cur_y = ex, ey
+            elif et == "CLICK_L":
+                pressed = True
+                last_press_t = t
+                if s["click_ripple"]:
+                    fired_rips.append((t, ex, ey))
+            elif et == "RELEASE_L":
+                pressed = False
+            ev_i += 1
+
+        sx, sy = smoother.update(cur_x, cur_y, t=tf)
+        spd    = math.sqrt(smoother.vx**2 + smoother.vy**2)
+
+        tilt = 0.0
+        if s["cursor_tilt"] and spd > 0.5:
+            tilt = math.atan2(smoother.vy, smoother.vx)*(180/math.pi)*0.15
+
+        if s["auto_hide"]:
+            if spd < 0.5:
+                idle_frames += 1
+                if idle_frames > fps * 1.5:
+                    cur_opacity = max(0.0, cur_opacity - 0.08)
+            else:
+                idle_frames = 0
+                cur_opacity = min(1.0, cur_opacity + 0.25)
+        else:
+            cur_opacity = 1.0
+
+        active = next((z for z in zoom_wins if z["s"] <= tf <= z["e"]), None)
+        if active:
+            zoom_eng.trigger(active["nx"], active["ny"], active["z"], t=tf)
+        else:
+            zoom_eng.release(t=tf)
+        z, zcx, zcy = zoom_eng.update(t=tf)
+
+        active_rips = [
+            (rx, ry, tf - rt, ripple_dur)
+            for (rt, rx, ry) in fired_rips
+            if 0 <= tf - rt < ripple_dur
+        ]
+
+        dragging = pressed and spd > 8.0
+
+        track.append({
+            "sx": sx, "sy": sy,
+            "tilt": tilt, "opacity": cur_opacity,
+            "zoom": z, "zcx": zcx, "zcy": zcy,
+            "pressed": pressed, "dragging": dragging,
+            "ripples": active_rips,
+        })
+
+    return track
+
+
+def _zoom_origin(zcx, zcy, z, sw, sh):
+    rw_z = sw / z
+    rh_z = sh / z
+    x1 = max(0, min(sw - rw_z, zcx * sw - rw_z / 2))
+    y1 = max(0, min(sh - rh_z, zcy * sh - rh_z / 2))
+    return x1, y1
+
+
+def render_frame(raw_bgr, st, s, sw, sh, cw, ch):
+    """Render one composited preview/export frame from the raw screen capture
+    plus the precomputed animation state."""
+    z = st["zoom"]
+    if z > 1.02:
+        h, w = raw_bgr.shape[:2]
+        rw, rh = int(w/z), int(h/z)
+        x1 = max(0, min(w-rw, int(st["zcx"]*w - rw/2)))
+        y1 = max(0, min(h-rh, int(st["zcy"]*h - rh/2)))
+        zoomed = cv2.resize(raw_bgr[y1:y1+rh, x1:x1+rw], (w, h),
+                            interpolation=cv2.INTER_LINEAR)
+    else:
+        zoomed = raw_bgr
+
+    img = Image.fromarray(cv2.cvtColor(zoomed, cv2.COLOR_BGR2RGBA))
+
+    sx, sy = st["sx"], st["sy"]
+    if z > 1.02:
+        x1z, y1z = _zoom_origin(st["zcx"], st["zcy"], z, sw, sh)
+        draw_sx = (sx - x1z) * z
+        draw_sy = (sy - y1z) * z
+    else:
+        draw_sx, draw_sy = sx, sy
+
+    # Ripples first, so cursor sits on top.
+    if st["ripples"]:
+        rd = ImageDraw.Draw(img)
+        for (rx, ry, age, dur) in st["ripples"]:
+            if z > 1.02:
+                x1z, y1z = _zoom_origin(st["zcx"], st["zcy"], z, sw, sh)
+                rxd = (rx - x1z) * z
+                ryd = (ry - y1z) * z
+            else:
+                rxd, ryd = rx, ry
+            prog = age / dur
+            ease = 1 - (1 - prog) ** 2
+            rad  = int(ease * 55)
+            alpha = int((1 - prog) * 180)
+            rd.ellipse([rxd-rad, ryd-rad, rxd+rad, ryd+rad],
+                       outline=(100, 150, 255, alpha), width=2)
+
+    if st["opacity"] > 0.02:
+        draw_cursor(img, draw_sx, draw_sy,
+                    size=s["cursor_size"], opacity=st["opacity"],
+                    tilt=st["tilt"],
+                    pressed=st["pressed"], dragging=st["dragging"])
+
+    canvas, *_ = composite(
+        img, cw, ch,
+        s["bg_type"], s["bg_val"],
+        s["padding"], s["inset"],
+        s["roundness"], s["shadow"])
+    return canvas
+
+
+def canvas_dims(meta_or_region, s):
+    """Resolve final canvas (cw, ch) given meta/region + settings."""
+    reg = meta_or_region.get("region") if "region" in meta_or_region else meta_or_region
+    sw, sh = reg["width"], reg["height"]
+    preset = s["canvas_preset"]
+    if preset and preset != "Original":
+        return CANVAS_PRESETS[preset]
+    p = s["padding"]
+    return sw + p*2 + 60, sh + p*2 + 60
 
 
 # ============================================================
@@ -587,226 +785,115 @@ class Processor:
         if not src.isOpened():
             self.prog(0, "Failed to open raw.mkv"); return False
 
-        # Event dicts → (t, type, x, y) tuples for downstream code
-        events = [(e["t"], e["type"], e["x"], e["y"]) for e in events_raw]
-
         s   = self.s
         fps = meta.get("fps", s["fps"])
         reg = meta.get("region") or s["region"]
         sw, sh = reg["width"], reg["height"]
+        cw, ch = canvas_dims(meta, s)
 
-        preset = s["canvas_preset"]
-        if preset and preset != "Original":
-            cw, ch = CANVAS_PRESETS[preset]
-        else:
-            p = s["padding"]
-            cw = sw + p*2 + 60
-            ch = sh + p*2 + 60
+        self.prog(2, "Computing animation track...")
+        track = precompute_track(events_raw, meta, s)
+        n = len(track) or int(src.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
 
-        # Build zoom windows from clicks
-        self.prog(2, "Analysing clicks...")
-        clicks = [(t,x-reg["left"],y-reg["top"])
-                  for (t,et,x,y) in events
-                  if et == "CLICK_L"]
-        zoom_wins = []
-        if s["auto_zoom"]:
-            for i,(t,cx,cy) in enumerate(clicks):
-                end = t + s["zoom_dur"]
-                if i+1 < len(clicks):
-                    end = min(end, clicks[i+1][0]-0.05)
-                zoom_wins.append({
-                    "s": t-0.05, "e": end,
-                    "nx": cx/sw,  "ny": cy/sh,
-                    "z":  s["zoom_level"]
-                })
-
-        # FFmpeg
         self.prog(5, "Opening encoder...")
         cmd = [
-            "ffmpeg","-y",
+            "ffmpeg","-y","-loglevel","error",
             "-f","rawvideo","-vcodec","rawvideo",
             "-s",f"{cw}x{ch}","-pix_fmt","bgr24",
             "-r",str(fps),"-i","pipe:0",
             "-c:v","libx264","-preset","fast",
             "-crf","17","-pix_fmt","yuv420p",
-            out_path
+            out_path,
         ]
         try:
             proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                     stdout=subprocess.DEVNULL,
                                     stderr=subprocess.DEVNULL)
         except FileNotFoundError:
-            self.prog(0,"FFmpeg not found!"); return False
+            src.release()
+            self.prog(0, "FFmpeg not found"); return False
 
-        # Use FocuSee's exact physics defaults
-        # mouseMovementSpring: stiffness=470, damping=70, mass=3
-        fps_val = s["fps"]
-        smoother = MassSpringDamper(
-            stiffness = s["stiffness"] * 1200.0,  # 0.12 slider → ~144 (feels like FocuSee at ~0.4)
-            damping   = s["damping"]   * 90.0,    # 0.75 slider → ~67 (FocuSee default is 70)
-            mass      = 3.0,
-            fps       = fps_val
-        )
-        zoom_eng = ZoomEngine()
-        smoother.reset(); zoom_eng.reset()
-
-        ripples  = []
-        used_rip = set()
-        sorted_ev = sorted(events, key=lambda e:e[0])
-        ev_i     = 0
-        cur_x, cur_y = sw//2, sh//2
-        n = meta.get("frame_count") or int(src.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
-        cur_opacity = 1.0
-        idle_frames = 0
-
-        self.prog(8, "Processing frames...")
-
+        self.prog(8, "Rendering frames...")
         fi = 0
-        while True:
+        while fi < n:
             ok, frame = src.read()
             if not ok: break
-            tf = fi / fps   # frame time relative to record start (shared clock with events)
-
-            # Advance events
-            while ev_i < len(sorted_ev) and sorted_ev[ev_i][0] <= tf:
-                ev = sorted_ev[ev_i]
-                et = ev[1]
-                ex = ev[2]-reg["left"]
-                ey = ev[3]-reg["top"]
-                if et == "MOVE":
-                    cur_x, cur_y = ex, ey
-                elif et == "CLICK_L" and ev[0] not in used_rip:
-                    used_rip.add(ev[0])
-                    if s["click_ripple"]:
-                        ripples.append(Ripple(ex,ey,(100,150,255,180)))
-                ev_i += 1
-
-            # Smooth cursor — mass-spring-damper physics
-            sx, sy = smoother.update(cur_x, cur_y, t=tf)
-
-            # Tilt — use physics velocity directly
-            tilt = 0.0
-            if s["cursor_tilt"]:
-                spd = math.sqrt(smoother.vx**2 + smoother.vy**2)
-                if spd > 0.5:
-                    tilt = math.atan2(smoother.vy, smoother.vx)*(180/math.pi)*0.15
-
-            # Auto-hide — cursor speed from physics velocity
-            if s["auto_hide"]:
-                spd = math.sqrt(smoother.vx**2 + smoother.vy**2)
-                if spd < 0.5:
-                    idle_frames += 1
-                    if idle_frames > fps_val * 1.5:
-                        cur_opacity = max(0.0, cur_opacity - 0.08)
-                else:
-                    idle_frames = 0
-                    cur_opacity = min(1.0, cur_opacity + 0.25)
-            else:
-                cur_opacity = 1.0
-
-            # Zoom — trigger/release with timestamps for cubic easing
-            active = next((z for z in zoom_wins
-                           if z["s"]<=tf<=z["e"]), None)
-            if active:
-                zoom_eng.trigger(active["nx"], active["ny"],
-                                 active["z"], t=tf)
-            else:
-                zoom_eng.release(t=tf)
-            z, zcx, zcy = zoom_eng.update(t=tf)
-
-            # Apply zoom to frame
-            zoomed = zoom_eng.apply(frame)
-
-            # Convert to PIL
-            img = Image.fromarray(cv2.cvtColor(zoomed, cv2.COLOR_BGR2RGBA))
-
-            # ── Remap cursor position to zoomed frame space
-            # When zoomed, visible region is a sub-rect of the full frame.
-            # Cursor must be mapped from screen space → zoomed frame space.
-            draw_sx, draw_sy = sx, sy
-            if z > 1.02:
-                rw_z = sw / z
-                rh_z = sh / z
-                x1_z = max(0, min(sw - rw_z, zoom_eng.cx * sw - rw_z / 2))
-                y1_z = max(0, min(sh - rh_z, zoom_eng.cy * sh - rh_z / 2))
-                draw_sx = (sx - x1_z) * z
-                draw_sy = (sy - y1_z) * z
-
-            # Draw cursor at remapped position
-            if cur_opacity > 0.02:
-                if fi == 0:
-                    print(f"[DEBUG] Frame 0 cursor at ({draw_sx:.0f},{draw_sy:.0f}), zoom={z:.2f}, opacity={cur_opacity:.2f}")
-                draw_cursor(img, draw_sx, draw_sy,
-                            size=s["cursor_size"],
-                            opacity=cur_opacity,
-                            tilt=tilt)
-
-            # Draw ripples — also remap positions when zoomed
-            now = tf
-            alive = []
-            for r in ripples:
-                rx_draw, ry_draw = r.x, r.y
-                if z > 1.02:
-                    rw_z = sw / z
-                    rh_z = sh / z
-                    x1_z = max(0, min(sw - rw_z, zoom_eng.cx * sw - rw_z / 2))
-                    y1_z = max(0, min(sh - rh_z, zoom_eng.cy * sh - rh_z / 2))
-                    rx_draw = (r.x - x1_z) * z
-                    ry_draw = (r.y - y1_z) * z
-                # Temporarily remap for drawing
-                orig_x, orig_y = r.x, r.y
-                r.x, r.y = rx_draw, ry_draw
-                if r.draw(img, now):
-                    alive.append(r)
-                    r.x, r.y = orig_x, orig_y  # restore real coords
-                else:
-                    pass  # expired
-            ripples = alive
-
-            # Composite
-            canvas,*_ = composite(
-                img, cw, ch,
-                s["bg_type"], s["bg_val"],
-                s["padding"], s["inset"],
-                s["roundness"], s["shadow"])
-
+            canvas = render_frame(frame, track[fi], s, sw, sh, cw, ch)
             bgr = cv2.cvtColor(np.array(canvas), cv2.COLOR_RGBA2BGR)
             try:
                 proc.stdin.write(bgr.tobytes())
             except BrokenPipeError:
                 break
-
-            if fi%15==0:
-                self.prog(8+int((fi/n)*87),
+            if fi % 15 == 0:
+                self.prog(8 + int((fi/n) * 87),
                           f"Frame {fi+1}/{n}  ({int(fi/n*100)}%)")
             fi += 1
 
         src.release()
         proc.stdin.close()
         proc.wait()
-        self.prog(100,"Done!")
+        self.prog(100, "Done!")
         return True
 
 
 # ============================================================
-#  UI
+#  UI  —  two-state shell:
+#         (1) Welcome:  big record button only
+#         (2) Editor:   embedded preview + sidebar after recording
 # ============================================================
 class App(ctk.CTk):
+    BG       = "#0a0a0f"
+    PANEL    = "#14141c"
+    PANEL_2  = "#1c1c28"
+    BORDER   = "#262635"
+    MUTED    = "#8b8b9c"
+    FG       = "#e6e6f0"
+    ACCENT   = "#6366f1"
+    ACCENT_H = "#818cf8"
+    DANGER   = "#ef4444"
+    OK       = "#22c55e"
+
+    SIDEBAR_W = 340
+
     def __init__(self):
         super().__init__()
-        self.title(f"{APP_NAME}  v{VERSION}")
-        self.geometry("460x900")
-        self.resizable(False, True)
-        self.configure(fg_color="#0d1117")
+        self.title(APP_NAME)
+        self.geometry("1280x820")
+        self.minsize(1100, 720)
+        self.configure(fg_color=self.BG)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        self.recorder = Recorder()
-        self.recording = False
-        self.bundle_path = None
+        # Recording state
+        self.recorder       = Recorder()
+        self.recording      = False
+        self.bundle_path    = None
+        self._rec_start     = 0.0
+
+        # Background selection (not a Var, so trace doesn't fire)
         self.bg_type = "gradient"
         self.bg_val  = GRADIENTS[0]
-        self._rec_start = 0.0
 
-        # Screen size
+        # Editor state
+        self._preview_src   = None
+        self._meta          = None
+        self._meta_events   = None
+        self._track         = None
+        self._track_key     = None
+        self._cur_frame     = 0
+        self._total         = 1
+        self._fps_meta      = 30
+        self._playing       = False
+        self._programmatic  = False
+        self._render_pending = False
+        self._tk_img        = None
+
+        # Hidden defaults (controls dropped from UI)
+        self._inset       = 0
+        self._cursor_tilt = True
+        self._auto_hide   = True
+        self._zoom_dur    = 1.5
+
+        # Detect display
         try:
             import ctypes as _c
             _c.windll.shcore.SetProcessDpiAwareness(2)
@@ -818,286 +905,349 @@ class App(ctk.CTk):
 
         if not HAS_DEPS:
             ctk.CTkLabel(self, text=f"Missing deps: {MISSING}",
-                         text_color="#ef4444").pack(pady=40)
+                         text_color=self.DANGER).pack(pady=40)
             return
 
-        self._build()
+        self._init_vars()
+        self._welcome_frame = self._build_welcome()
+        self._editor_frame  = None
+        self._show_welcome()
 
-    # ── helpers
-    def _label(self, parent, text, size=12, color="#94a3b8", bold=False):
+    # ── shared variables ───────────────────────────────────────
+    def _init_vars(self):
+        self.fps_var          = ctk.StringVar(value="30")
+        self.canvas_var       = ctk.StringVar(value="16:9")
+        self.padding_var      = ctk.DoubleVar(value=60)
+        self.roundness_var    = ctk.DoubleVar(value=14)
+        self.shadow_var       = ctk.DoubleVar(value=70)
+        self.cursor_size_var  = ctk.DoubleVar(value=36)
+        self.smooth_var       = ctk.DoubleVar(value=0.7)
+        self.ripple_var       = ctk.BooleanVar(value=True)
+        self.autozoom_var     = ctk.BooleanVar(value=True)
+        self.zoomlevel_var    = ctk.DoubleVar(value=2.0)
+
+        for v in (self.canvas_var, self.padding_var, self.roundness_var,
+                  self.shadow_var, self.cursor_size_var, self.smooth_var,
+                  self.ripple_var, self.autozoom_var, self.zoomlevel_var):
+            v.trace_add("write", lambda *a: self._request_render())
+
+    # ── small helpers ──────────────────────────────────────────
+    def _label(self, parent, text, size=12, color=None, bold=False):
         return ctk.CTkLabel(parent, text=text,
-                            font=ctk.CTkFont("Segoe UI", size,
-                                             weight="bold" if bold else "normal"),
-                            text_color=color)
+            font=ctk.CTkFont("Segoe UI", size,
+                             weight="bold" if bold else "normal"),
+            text_color=color or self.MUTED)
 
     def _section(self, parent, title):
         f = ctk.CTkFrame(parent, fg_color="transparent")
-        f.pack(fill="x", padx=16, pady=(14,2))
-        self._label(f, title, 10, "#475569", bold=True).pack(side="left")
-        ctk.CTkFrame(f, height=1, fg_color="#1e2d4a").pack(
-            side="left", fill="x", expand=True, padx=(8,0))
+        f.pack(fill="x", padx=18, pady=(20, 6))
+        self._label(f, title, 10, "#5e5e75", bold=True).pack(side="left")
+        ctk.CTkFrame(f, height=1, fg_color=self.BORDER).pack(
+            side="left", fill="x", expand=True, padx=(10, 0))
 
-    def _slider(self, parent, label, attr, lo, hi, default,
-                fmt=None, row_pad=(4,0)):
+    def _slider(self, parent, label, var, lo, hi, fmt=None):
         if fmt is None:
             fmt = lambda v: str(int(float(v)))
-        var = ctk.DoubleVar(value=default)
-        setattr(self, attr, var)
         row = ctk.CTkFrame(parent, fg_color="transparent")
-        row.pack(fill="x", padx=16, pady=row_pad)
-        self._label(row, label, 11, "#94a3b8").pack(side="left")
-        val_lbl = self._label(row, fmt(default), 11, "#6366f1", bold=True)
+        row.pack(fill="x", padx=18, pady=(8, 0))
+        self._label(row, label, 11).pack(side="left")
+        val_lbl = self._label(row, fmt(var.get()), 11, self.ACCENT, bold=True)
         val_lbl.pack(side="right")
-        sl = ctk.CTkSlider(row, from_=lo, to=hi,
-                           variable=var, width=200,
-                           button_color="#6366f1",
-                           button_hover_color="#8b5cf6",
-                           progress_color="#6366f1",
+        sl = ctk.CTkSlider(row, from_=lo, to=hi, variable=var,
+                           button_color=self.ACCENT,
+                           button_hover_color=self.ACCENT_H,
+                           progress_color=self.ACCENT,
                            command=lambda v, l=val_lbl, f=fmt: l.configure(text=f(v)))
-        sl.pack(side="right", padx=(0,8))
+        sl.pack(fill="x", padx=(12, 8), pady=(2, 0))
 
-    def _toggle(self, parent, label, attr, default=True):
-        var = ctk.BooleanVar(value=default)
-        setattr(self, attr, var)
+    def _toggle(self, parent, label, var):
         row = ctk.CTkFrame(parent, fg_color="transparent")
-        row.pack(fill="x", padx=16, pady=(4,0))
-        self._label(row, label, 11, "#94a3b8").pack(side="left")
+        row.pack(fill="x", padx=18, pady=(10, 0))
+        self._label(row, label, 11, self.FG).pack(side="left")
         ctk.CTkSwitch(row, variable=var, text="",
                       width=40, height=20,
-                      button_color="#6366f1",
-                      button_hover_color="#8b5cf6",
-                      progress_color="#6366f1"
-                      ).pack(side="right")
+                      button_color=self.ACCENT,
+                      button_hover_color=self.ACCENT_H,
+                      progress_color=self.ACCENT).pack(side="right")
 
-    # ── main build
-    def _build(self):
-        # Header
-        hdr = ctk.CTkFrame(self, fg_color="#0d1117", height=80, corner_radius=0)
-        hdr.pack(fill="x")
-        hdr.pack_propagate(False)
-        ctk.CTkLabel(hdr, text=APP_NAME,
-                     font=ctk.CTkFont("Segoe UI", 28, weight="bold"),
-                     text_color="#ffffff").pack(pady=(16,0))
-        ctk.CTkLabel(hdr, text=f"Screen: {self.sw} × {self.sh}",
+    # ── state switching ────────────────────────────────────────
+    def _show_welcome(self):
+        if self._editor_frame:
+            self._editor_frame.pack_forget()
+        self._welcome_frame.pack(fill="both", expand=True)
+
+    def _show_editor(self):
+        self._welcome_frame.pack_forget()
+        if not self._editor_frame:
+            self._editor_frame = self._build_editor()
+        self._editor_frame.pack(fill="both", expand=True)
+        self.after(150, self._load_bundle_into_preview)
+
+    # ── WELCOME screen ─────────────────────────────────────────
+    def _build_welcome(self):
+        wrap = ctk.CTkFrame(self, fg_color=self.BG)
+        center = ctk.CTkFrame(wrap, fg_color="transparent")
+        center.place(relx=0.5, rely=0.5, anchor="center")
+
+        ctk.CTkLabel(center, text=APP_NAME,
+                     font=ctk.CTkFont("Segoe UI", 56, weight="bold"),
+                     text_color=self.FG).pack()
+        ctk.CTkLabel(center, text="Beautiful screen recordings, automatically",
+                     font=ctk.CTkFont("Segoe UI", 15),
+                     text_color=self.MUTED).pack(pady=(4, 36))
+
+        self.welcome_btn = ctk.CTkButton(
+            center, text="●  Start Recording",
+            width=260, height=62,
+            font=ctk.CTkFont("Segoe UI", 16, weight="bold"),
+            fg_color=self.OK, hover_color="#16a34a",
+            corner_radius=12,
+            command=self.toggle_recording)
+        self.welcome_btn.pack(pady=(0, 22))
+
+        fps_row = ctk.CTkFrame(center, fg_color="transparent")
+        fps_row.pack()
+        ctk.CTkLabel(fps_row, text="Frame rate",
+                     font=ctk.CTkFont("Segoe UI", 11),
+                     text_color=self.MUTED).pack(side="left", padx=(0, 12))
+        for f in ("30", "60"):
+            ctk.CTkRadioButton(
+                fps_row, text=f"{f} fps",
+                variable=self.fps_var, value=f,
+                radiobutton_width=14, radiobutton_height=14,
+                fg_color=self.ACCENT, hover_color=self.ACCENT_H,
+                font=ctk.CTkFont("Segoe UI", 12),
+                text_color=self.FG).pack(side="left", padx=8)
+
+        info = (f"Display: {self.sw} × {self.sh}     "
+                f"Backend: {'WGC (cursor excluded)' if HAS_WGC else 'mss (cursor in footage)'}")
+        ctk.CTkLabel(center, text=info,
                      font=ctk.CTkFont("Segoe UI", 10),
-                     text_color="#475569").pack()
+                     text_color="#5e5e75").pack(pady=(36, 0))
 
-        # Scrollable settings
-        scroll = ctk.CTkScrollableFrame(self, fg_color="#0d1117",
-                                         scrollbar_button_color="#1e2d4a",
-                                         scrollbar_button_hover_color="#6366f1")
-        scroll.pack(fill="both", expand=True, padx=0, pady=0)
+        self.welcome_status = ctk.CTkLabel(
+            center, text="",
+            font=ctk.CTkFont("Cascadia Code", 26, weight="bold"),
+            text_color=self.ACCENT)
+        self.welcome_status.pack(pady=(28, 0))
+        return wrap
 
-        # ── CANVAS SIZE
-        self._section(scroll, "CANVAS SIZE")
-        cp = ctk.CTkFrame(scroll, fg_color="transparent")
-        cp.pack(fill="x", padx=16, pady=(4,0))
-        self.canvas_var = ctk.StringVar(value="Original")
-        self._preset_btns = {}
-        for preset in ["Original","16:9","1:1","4:3","9:16"]:
-            is_sel = (preset == "Original")
-            b = ctk.CTkButton(cp, text=preset, width=68, height=30,
-                              font=ctk.CTkFont("Segoe UI", 11, weight="bold"),
-                              fg_color="#6366f1" if is_sel else "#1e2d4a",
-                              hover_color="#8b5cf6",
-                              corner_radius=6,
-                              command=lambda p=preset: self._set_preset(p))
-            b.pack(side="left", padx=3)
-            self._preset_btns[preset] = b
+    # ── EDITOR screen ──────────────────────────────────────────
+    def _build_editor(self):
+        wrap = ctk.CTkFrame(self, fg_color=self.BG)
 
-        # ── STYLE
-        self._section(scroll, "STYLE")
-        self._toggle(scroll, "Fixed Zoom Part", "fixed_zoom_var", True)
-        self._slider(scroll, "Padding",   "padding_var",   0, 120, 30)
-        self._slider(scroll, "Inset",     "inset_var",     0, 20,  0)
-        self._slider(scroll, "Roundness", "roundness_var", 0, 40,  8)
-        self._slider(scroll, "Shadow",    "shadow_var",    0, 100, 60)
+        # Top bar
+        top = ctk.CTkFrame(wrap, fg_color=self.PANEL, height=58, corner_radius=0)
+        top.pack(fill="x")
+        top.pack_propagate(False)
+        ctk.CTkFrame(wrap, height=1, fg_color=self.BORDER).pack(fill="x")
 
-        # ── BACKGROUND
-        self._section(scroll, "BACKGROUND")
-        ctk.CTkLabel(scroll, text="Gradients",
-                     font=ctk.CTkFont("Segoe UI",10),
-                     text_color="#475569").pack(anchor="w", padx=16, pady=(6,2))
+        ctk.CTkLabel(top, text=APP_NAME,
+                     font=ctk.CTkFont("Segoe UI", 18, weight="bold"),
+                     text_color=self.FG).pack(side="left", padx=22)
 
-        # Gradient grid
-        gg = ctk.CTkFrame(scroll, fg_color="transparent")
-        gg.pack(fill="x", padx=16)
-        self._bg_btns = []
-        for i,(c1,c2) in enumerate(GRADIENTS):
-            btn = tk.Canvas(gg, width=40, height=26,
-                             highlightthickness=2,
-                             highlightbackground="#6366f1" if i==0 else "#1e2d4a",
-                             cursor="hand2")
-            btn.grid(row=i//6, column=i%6, padx=3, pady=3)
-            for x in range(40):
-                t = x/40
-                r=int(int(c1[1:3],16)*(1-t)+int(c2[1:3],16)*t)
-                g=int(int(c1[3:5],16)*(1-t)+int(c2[3:5],16)*t)
-                b=int(int(c1[5:7],16)*(1-t)+int(c2[5:7],16)*t)
-                btn.create_line(x,0,x,26, fill=f"#{r:02x}{g:02x}{b:02x}")
-            btn.bind("<Button-1>", lambda e,idx=i,b=btn: self._set_bg_grad(idx,b))
-            self._bg_btns.append(btn)
+        right = ctk.CTkFrame(top, fg_color="transparent")
+        right.pack(side="right", padx=14)
+        ctk.CTkButton(right, text="New Recording",
+                      width=130, height=34,
+                      font=ctk.CTkFont("Segoe UI", 12),
+                      fg_color=self.PANEL_2, hover_color=self.BORDER,
+                      text_color=self.FG, corner_radius=8,
+                      command=self._new_recording).pack(side="left", padx=4)
+        ctk.CTkButton(right, text="Export MP4",
+                      width=130, height=34,
+                      font=ctk.CTkFont("Segoe UI", 12, weight="bold"),
+                      fg_color=self.ACCENT, hover_color=self.ACCENT_H,
+                      corner_radius=8,
+                      command=self.export_mp4).pack(side="left", padx=4)
 
-        ctk.CTkLabel(scroll, text="Solid Colors",
-                     font=ctk.CTkFont("Segoe UI",10),
-                     text_color="#475569").pack(anchor="w", padx=16, pady=(10,2))
-        sg = ctk.CTkFrame(scroll, fg_color="transparent")
-        sg.pack(fill="x", padx=16, pady=(0,4))
-        for i,col in enumerate(SOLIDS):
-            btn = tk.Canvas(sg, width=32, height=22, bg=col,
-                             highlightthickness=2,
-                             highlightbackground="#1e2d4a",
-                             cursor="hand2")
-            btn.grid(row=i//8, column=i%8, padx=3, pady=3)
-            btn.bind("<Button-1>", lambda e,c=col,b=btn: self._set_bg_solid(c,b))
-            self._bg_btns.append(btn)
+        # Body: preview (left) + sidebar (right)
+        body = ctk.CTkFrame(wrap, fg_color=self.BG)
+        body.pack(fill="both", expand=True)
 
-        # ── CURSOR
-        self._section(scroll, "CURSOR")
-        self._slider(scroll, "Size",      "cursor_size_var",  16, 64, 32)
-        self._slider(scroll, "Stiffness", "stiffness_var",    0.05, 0.5, 0.12,
-                     fmt=lambda v: f"{float(v):.2f}")
-        self._slider(scroll, "Damping",   "damping_var",      0.5, 1.0, 0.75,
-                     fmt=lambda v: f"{float(v):.2f}")
-        self._toggle(scroll, "Cursor Tilt",    "tilt_var",     True)
-        self._toggle(scroll, "Click Ripples",  "ripple_var",   True)
-        self._toggle(scroll, "Auto-hide Idle", "autohide_var", True)
+        side = ctk.CTkScrollableFrame(
+            body, fg_color=self.PANEL, width=self.SIDEBAR_W, corner_radius=0,
+            scrollbar_button_color="#2a2a3e",
+            scrollbar_button_hover_color=self.ACCENT)
+        side.pack(side="right", fill="y")
+        ctk.CTkFrame(body, width=1, fg_color=self.BORDER).pack(side="right", fill="y")
+        self._build_sidebar(side)
 
-        # ── AUTO ZOOM
-        self._section(scroll, "AUTO ZOOM")
-        self._toggle(scroll, "Auto Zoom on Click", "autozoom_var", True)
-        self._slider(scroll, "Zoom Level",    "zoomlevel_var",  1.2, 3.0, 2.0,
-                     fmt=lambda v: f"{float(v):.1f}×")
-        self._slider(scroll, "Zoom Duration", "zoomdur_var",    0.5, 4.0, 1.5,
-                     fmt=lambda v: f"{float(v):.1f}s")
+        prev_area = ctk.CTkFrame(body, fg_color=self.BG)
+        prev_area.pack(side="left", fill="both", expand=True)
 
-        # ── EXPORT
-        self._section(scroll, "EXPORT")
-        fps_row = ctk.CTkFrame(scroll, fg_color="transparent")
-        fps_row.pack(fill="x", padx=16, pady=(4,8))
-        ctk.CTkLabel(fps_row, text="FPS",
-                     font=ctk.CTkFont("Segoe UI",11),
-                     text_color="#94a3b8").pack(side="left")
-        self.fps_var = ctk.StringVar(value="30")
-        for f in ["24","30","60"]:
-            ctk.CTkRadioButton(fps_row, text=f,
-                               variable=self.fps_var, value=f,
-                               radiobutton_width=16, radiobutton_height=16,
-                               fg_color="#6366f1",
-                               hover_color="#8b5cf6",
-                               font=ctk.CTkFont("Segoe UI",11),
-                               text_color="#94a3b8"
-                               ).pack(side="left", padx=10)
+        self.prev_canvas = ctk.CTkFrame(prev_area, fg_color="#000000",
+                                         corner_radius=10)
+        self.prev_canvas.pack(fill="both", expand=True, padx=24, pady=(20, 12))
+        self.prev_canvas.bind("<Configure>",
+                              lambda e: self._request_render(recompute_track=False))
+        self.prev_label = ctk.CTkLabel(self.prev_canvas, text="")
+        self.prev_label.place(relx=0.5, rely=0.5, anchor="center")
 
-        # ── Bottom bar
-        bar = ctk.CTkFrame(self, fg_color="#111627", height=160, corner_radius=0)
-        bar.pack(fill="x", side="bottom")
-        bar.pack_propagate(False)
+        # Transport bar
+        tr = ctk.CTkFrame(prev_area, fg_color=self.PANEL, height=64, corner_radius=14)
+        tr.pack(fill="x", padx=24, pady=(0, 6))
+        tr.pack_propagate(False)
 
-        # Top accent line
-        ctk.CTkFrame(bar, height=2, fg_color="#6366f1",
-                     corner_radius=0).pack(fill="x")
+        self.play_btn = ctk.CTkButton(
+            tr, text="▶", width=44, height=44,
+            font=ctk.CTkFont("Segoe UI", 16, weight="bold"),
+            fg_color=self.ACCENT, hover_color=self.ACCENT_H,
+            corner_radius=22, command=self._toggle_play)
+        self.play_btn.pack(side="left", padx=12, pady=10)
 
-        # Timer
-        self.timer_var = ctk.StringVar(value="00:00.000")
-        ctk.CTkLabel(bar, textvariable=self.timer_var,
-                     font=ctk.CTkFont("Cascadia Code", 28, weight="bold"),
-                     text_color="#6366f1").pack(pady=(10,0))
+        self.time_lbl = ctk.CTkLabel(
+            tr, text="00:00 / 00:00",
+            font=ctk.CTkFont("Cascadia Code", 12),
+            text_color=self.MUTED, width=110)
+        self.time_lbl.pack(side="left", padx=(0, 8))
 
-        self.status_var = ctk.StringVar(value="Ready to record")
-        self.status_lbl = ctk.CTkLabel(bar, textvariable=self.status_var,
-                                        font=ctk.CTkFont("Segoe UI", 10),
-                                        text_color="#475569")
-        self.status_lbl.pack()
+        self.scrub_var = ctk.DoubleVar(value=0)
+        self.scrub = ctk.CTkSlider(
+            tr, from_=0, to=1, variable=self.scrub_var,
+            button_color=self.ACCENT, button_hover_color=self.ACCENT_H,
+            progress_color=self.ACCENT,
+            command=self._on_scrub)
+        self.scrub.pack(side="left", fill="x", expand=True, padx=12, pady=10)
 
-        # Progress bar
+        # Export progress
         self.prog_var = ctk.DoubleVar(value=0)
-        self.prog_bar = ctk.CTkProgressBar(bar, variable=self.prog_var,
-                                            width=420,
-                                            progress_color="#6366f1",
-                                            fg_color="#1e2d4a")
-        self.prog_bar.pack(pady=(4,0))
+        self.prog_bar = ctk.CTkProgressBar(prev_area, variable=self.prog_var,
+                                            progress_color=self.ACCENT,
+                                            fg_color=self.PANEL, height=4)
+        self.prog_bar.pack(fill="x", padx=24, pady=(8, 4))
         self.prog_var.set(0)
 
-        # Buttons
-        btn_row = ctk.CTkFrame(bar, fg_color="transparent")
-        btn_row.pack(pady=8)
+        self.status_var = ctk.StringVar(value="")
+        ctk.CTkLabel(prev_area, textvariable=self.status_var,
+                     font=ctk.CTkFont("Segoe UI", 10),
+                     text_color=self.MUTED).pack(pady=(0, 8))
 
-        self.rec_btn = ctk.CTkButton(btn_row,
-                                      text="Start Recording",
-                                      width=160, height=38,
-                                      font=ctk.CTkFont("Segoe UI",12,weight="bold"),
-                                      fg_color="#22c55e",
-                                      hover_color="#16a34a",
-                                      corner_radius=8,
-                                      command=self.toggle_recording)
-        self.rec_btn.pack(side="left", padx=4)
+        return wrap
 
-        self.exp_btn = ctk.CTkButton(btn_row,
-                                      text="Export MP4",
-                                      width=120, height=38,
-                                      font=ctk.CTkFont("Segoe UI",12,weight="bold"),
-                                      fg_color="#1e2d4a",
-                                      hover_color="#6366f1",
-                                      state="disabled",
-                                      corner_radius=8,
-                                      command=self.export_mp4)
-        self.exp_btn.pack(side="left", padx=4)
+    # ── Sidebar (pared down to essentials) ────────────────────
+    def _build_sidebar(self, parent):
+        # CANVAS
+        self._section(parent, "CANVAS")
+        cp = ctk.CTkFrame(parent, fg_color="transparent")
+        cp.pack(fill="x", padx=14, pady=(2, 0))
+        self._preset_btns = {}
+        for preset in ("Original", "16:9", "1:1", "4:3", "9:16"):
+            sel = (preset == self.canvas_var.get())
+            b = ctk.CTkButton(cp, text=preset, width=58, height=30,
+                              font=ctk.CTkFont("Segoe UI", 11, weight="bold"),
+                              fg_color=self.ACCENT if sel else self.PANEL_2,
+                              hover_color=self.ACCENT_H,
+                              corner_radius=7,
+                              command=lambda p=preset: self._set_preset(p))
+            b.pack(side="left", padx=2)
+            self._preset_btns[preset] = b
 
-        self.prev_btn = ctk.CTkButton(btn_row,
-                                       text="Preview",
-                                       width=100, height=38,
-                                       font=ctk.CTkFont("Segoe UI",12,weight="bold"),
-                                       fg_color="#1e2d4a",
-                                       hover_color="#6366f1",
-                                       state="disabled",
-                                       corner_radius=8,
-                                       command=self.open_preview)
-        self.prev_btn.pack(side="left", padx=4)
+        # BACKGROUND
+        self._section(parent, "BACKGROUND")
+        ctk.CTkLabel(parent, text="Gradients",
+                     font=ctk.CTkFont("Segoe UI", 10),
+                     text_color="#5e5e75").pack(anchor="w", padx=18, pady=(2, 4))
+        gg = ctk.CTkFrame(parent, fg_color="transparent")
+        gg.pack(padx=14)
+        self._bg_btns = []
+        for i, (c1, c2) in enumerate(GRADIENTS):
+            btn = tk.Canvas(gg, width=44, height=28,
+                             highlightthickness=2,
+                             highlightbackground=self.ACCENT if i == 0 else self.BORDER,
+                             cursor="hand2", bd=0)
+            btn.grid(row=i // 6, column=i % 6, padx=3, pady=3)
+            for x in range(44):
+                t = x / 44
+                r = int(int(c1[1:3], 16) * (1 - t) + int(c2[1:3], 16) * t)
+                g = int(int(c1[3:5], 16) * (1 - t) + int(c2[3:5], 16) * t)
+                b = int(int(c1[5:7], 16) * (1 - t) + int(c2[5:7], 16) * t)
+                btn.create_line(x, 0, x, 28, fill=f"#{r:02x}{g:02x}{b:02x}")
+            btn.bind("<Button-1>", lambda e, idx=i, b=btn: self._set_bg_grad(idx, b))
+            self._bg_btns.append(btn)
 
-    # ── BG / preset helpers
+        ctk.CTkLabel(parent, text="Solid colors",
+                     font=ctk.CTkFont("Segoe UI", 10),
+                     text_color="#5e5e75").pack(anchor="w", padx=18, pady=(12, 4))
+        sg = ctk.CTkFrame(parent, fg_color="transparent")
+        sg.pack(padx=14, pady=(0, 4))
+        for i, col in enumerate(SOLIDS):
+            btn = tk.Canvas(sg, width=34, height=24, bg=col, bd=0,
+                             highlightthickness=2,
+                             highlightbackground=self.BORDER, cursor="hand2")
+            btn.grid(row=i // 8, column=i % 8, padx=3, pady=3)
+            btn.bind("<Button-1>", lambda e, c=col, b=btn: self._set_bg_solid(c, b))
+            self._bg_btns.append(btn)
+
+        # FRAME STYLE
+        self._section(parent, "FRAME")
+        self._slider(parent, "Padding",   self.padding_var,   0, 160)
+        self._slider(parent, "Roundness", self.roundness_var, 0, 40)
+        self._slider(parent, "Shadow",    self.shadow_var,    0, 100)
+
+        # CURSOR
+        self._section(parent, "CURSOR")
+        self._slider(parent, "Size",       self.cursor_size_var, 16, 64)
+        self._slider(parent, "Smoothness", self.smooth_var, 0.0, 1.0,
+                     fmt=lambda v: f"{float(v):.2f}")
+        self._toggle(parent, "Click ripples", self.ripple_var)
+
+        # AUTO ZOOM
+        self._section(parent, "AUTO ZOOM")
+        self._toggle(parent, "Zoom on click", self.autozoom_var)
+        self._slider(parent, "Zoom level", self.zoomlevel_var, 1.2, 3.0,
+                     fmt=lambda v: f"{float(v):.1f}×")
+
+        ctk.CTkFrame(parent, fg_color="transparent", height=20).pack()
+
+    # ── Background pickers ─────────────────────────────────────
     def _set_preset(self, p):
         self.canvas_var.set(p)
-        for name,b in self._preset_btns.items():
-            b.configure(fg_color="#6366f1" if name==p else "#1e2d4a")
+        for name, b in self._preset_btns.items():
+            b.configure(fg_color=self.ACCENT if name == p else self.PANEL_2)
 
     def _set_bg_grad(self, idx, btn):
         self.bg_type = "gradient"
         self.bg_val  = GRADIENTS[idx]
         for b in self._bg_btns:
-            b.configure(highlightbackground="#1e2d4a")
-        btn.configure(highlightbackground="#6366f1")
+            b.configure(highlightbackground=self.BORDER)
+        btn.configure(highlightbackground=self.ACCENT)
+        self._request_render()
 
     def _set_bg_solid(self, col, btn):
         self.bg_type = "solid"
         self.bg_val  = col
         for b in self._bg_btns:
-            b.configure(highlightbackground="#1e2d4a")
-        btn.configure(highlightbackground="#6366f1")
+            b.configure(highlightbackground=self.BORDER)
+        btn.configure(highlightbackground=self.ACCENT)
+        self._request_render()
 
+    # ── settings dict (single source of truth for render+export)
     def _settings(self):
+        smooth = float(self.smooth_var.get())
         return {
-            "fps":         int(self.fps_var.get()),
-            "region":      {"left":0,"top":0,"width":self.sw,"height":self.sh},
+            "fps":           int(self.fps_var.get()),
+            "region":        {"left": 0, "top": 0,
+                              "width": self.sw, "height": self.sh},
             "canvas_preset": self.canvas_var.get(),
-            "padding":     int(self.padding_var.get()),
-            "inset":       int(self.inset_var.get()),
-            "roundness":   int(self.roundness_var.get()),
-            "shadow":      int(self.shadow_var.get()),
-            "bg_type":     self.bg_type,
-            "bg_val":      self.bg_val,
-            "cursor_size": int(self.cursor_size_var.get()),
-            "stiffness":   float(self.stiffness_var.get()),
-            "damping":     float(self.damping_var.get()),
-            "cursor_tilt": self.tilt_var.get(),
-            "click_ripple":self.ripple_var.get(),
-            "auto_hide":   self.autohide_var.get(),
-            "auto_zoom":   self.autozoom_var.get(),
-            "zoom_level":  float(self.zoomlevel_var.get()),
-            "zoom_dur":    float(self.zoomdur_var.get()),
+            "padding":       int(self.padding_var.get()),
+            "inset":         self._inset,
+            "roundness":     int(self.roundness_var.get()),
+            "shadow":        int(self.shadow_var.get()),
+            "bg_type":       self.bg_type,
+            "bg_val":        self.bg_val,
+            "cursor_size":   int(self.cursor_size_var.get()),
+            "stiffness":     0.05 + (1.0 - smooth) * 0.45,
+            "damping":       0.55 + smooth * 0.30,
+            "cursor_tilt":   self._cursor_tilt,
+            "click_ripple":  self.ripple_var.get(),
+            "auto_hide":     self._auto_hide,
+            "auto_zoom":     self.autozoom_var.get(),
+            "zoom_level":    float(self.zoomlevel_var.get()),
+            "zoom_dur":      self._zoom_dur,
         }
 
-    # ── Recording
+    # ── Recording ──────────────────────────────────────────────
     def toggle_recording(self):
         if not self.recording:
             self.bundle_path = os.path.join(
@@ -1105,7 +1255,8 @@ class App(ctk.CTk):
                 f"screensee_{int(time.time())}.screensee")
             self.recording = True
             self._rec_start = time.perf_counter()
-            region = {"left":0,"top":0,"width":self.sw,"height":self.sh}
+            region = {"left": 0, "top": 0,
+                      "width": self.sw, "height": self.sh}
             self.recorder = Recorder(fps=int(self.fps_var.get()))
             try:
                 self.recorder.start(region, self.bundle_path)
@@ -1113,165 +1264,196 @@ class App(ctk.CTk):
                 messagebox.showerror("Recorder", str(e))
                 self.recording = False
                 return
-            backend_msg = "Recording (cursor excluded)" if HAS_WGC else "Recording (mss — cursor will be in footage)"
-            self.rec_btn.configure(text="Stop Recording",
-                                    fg_color="#ef4444",
-                                    hover_color="#dc2626")
-            self.exp_btn.configure(state="disabled", fg_color="#1e2d4a")
-            self.prev_btn.configure(state="disabled", fg_color="#1e2d4a")
-            self.status_var.set(backend_msg)
-            self.status_lbl.configure(text_color="#22c55e")
+            self.welcome_btn.configure(text="■  Stop Recording",
+                                        fg_color=self.DANGER,
+                                        hover_color="#dc2626")
+            self.welcome_status.configure(text="00:00.000")
             self._tick()
         else:
             self.recording = False
             self.recorder.stop()
-            self.rec_btn.configure(text="Start Recording",
-                                    fg_color="#22c55e",
-                                    hover_color="#16a34a")
-            self.exp_btn.configure(state="normal", fg_color="#6366f1")
-            self.prev_btn.configure(state="normal", fg_color="#1e2d4a")
-            try:
-                meta_path = os.path.join(self.bundle_path, "meta.json")
-                with open(meta_path) as f:
-                    meta = json.load(f)
-                self.status_var.set(
-                    f"Done — {meta['frame_count']} frames  •  "
-                    f"{meta['duration']:.1f}s  •  bundle: {self.bundle_path}")
-            except Exception:
-                self.status_var.set(f"Done — bundle: {self.bundle_path}")
-            self.status_lbl.configure(text_color="#475569")
+            self.welcome_btn.configure(text="●  Start Recording",
+                                        fg_color=self.OK,
+                                        hover_color="#16a34a")
+            self.welcome_status.configure(text="")
+            self._show_editor()
 
     def _tick(self):
         if self.recording:
-            e = time.perf_counter()-self._rec_start
-            self.timer_var.set(
-                f"{int(e//60):02d}:{int(e%60):02d}.{int((e%1)*1000):03d}")
+            e = time.perf_counter() - self._rec_start
+            self.welcome_status.configure(
+                text=f"{int(e//60):02d}:{int(e%60):02d}.{int((e%1)*1000):03d}")
             self.after(33, self._tick)
 
-    # ── Export
+    def _new_recording(self):
+        self._playing = False
+        if self._preview_src:
+            try: self._preview_src.release()
+            except Exception: pass
+            self._preview_src = None
+        self.bundle_path = None
+        self._meta = None
+        self._track = None
+        self._track_key = None
+        self.welcome_btn.configure(text="●  Start Recording",
+                                    fg_color=self.OK)
+        self.welcome_status.configure(text="")
+        self._show_welcome()
+
+    # ── Preview / playback ────────────────────────────────────
+    def _load_bundle_into_preview(self):
+        if not self.bundle_path or not os.path.isdir(self.bundle_path):
+            return
+        if self._preview_src:
+            try: self._preview_src.release()
+            except Exception: pass
+        raw = os.path.join(self.bundle_path, "raw.mkv")
+        self._preview_src = cv2.VideoCapture(raw)
+        if not self._preview_src.isOpened():
+            messagebox.showerror("Preview", f"Failed to open {raw}")
+            return
+        try:
+            with open(os.path.join(self.bundle_path, "meta.json")) as f:
+                self._meta = json.load(f)
+            with open(os.path.join(self.bundle_path, "events.json")) as f:
+                self._meta_events = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            messagebox.showerror("Preview", f"Bad bundle: {e}")
+            return
+        self._fps_meta = self._meta["fps"]
+        self._total = max(1, self._meta.get("frame_count") or 1)
+        self._cur_frame = 0
+        self.scrub.configure(to=max(1, self._total - 1))
+        self._programmatic = True
+        self.scrub_var.set(0)
+        self._programmatic = False
+        self._track_key = None
+        self._request_render()
+
+    def _request_render(self, recompute_track=True):
+        if recompute_track:
+            self._track_key = None
+        if self._render_pending:
+            return
+        self._render_pending = True
+        self.after(40, self._do_render)
+
+    def _do_render(self):
+        self._render_pending = False
+        if (not self._editor_frame or not self._meta
+                or self._preview_src is None):
+            return
+        s = self._settings()
+        key = (s["padding"], s["roundness"], s["shadow"],
+               s["bg_type"], str(s["bg_val"]),
+               s["cursor_size"], s["stiffness"], s["damping"],
+               s["click_ripple"], s["auto_zoom"], s["zoom_level"],
+               s["zoom_dur"], s["canvas_preset"])
+        if key != self._track_key:
+            self._track = precompute_track(self._meta_events, self._meta, s)
+            self._track_key = key
+        self._render_current_frame()
+
+    def _render_current_frame(self):
+        if not self._track:
+            return
+        fi = max(0, min(self._cur_frame, self._total - 1, len(self._track) - 1))
+        self._preview_src.set(cv2.CAP_PROP_POS_FRAMES, fi)
+        ok, frame = self._preview_src.read()
+        if not ok:
+            return
+        s = self._settings()
+        reg = self._meta["region"]
+        sw, sh = reg["width"], reg["height"]
+        cw, ch = canvas_dims(self._meta, s)
+
+        canvas = render_frame(frame, self._track[fi], s, sw, sh, cw, ch)
+
+        pw = max(160, self.prev_canvas.winfo_width() - 8)
+        ph = max(120, self.prev_canvas.winfo_height() - 8)
+        asp = cw / ch
+        if asp > pw / ph:
+            ow = pw; oh = max(1, int(pw / asp))
+        else:
+            oh = ph; ow = max(1, int(ph * asp))
+        small = canvas.resize((ow, oh), Image.LANCZOS)
+        self._tk_img = ImageTk.PhotoImage(small)
+        self.prev_label.configure(image=self._tk_img, text="")
+
+        cs = fi / self._fps_meta
+        ts = self._total / self._fps_meta
+        self.time_lbl.configure(
+            text=f"{int(cs//60):02d}:{int(cs%60):02d} / "
+                 f"{int(ts//60):02d}:{int(ts%60):02d}")
+
+    def _on_scrub(self, v):
+        if self._programmatic:
+            return
+        self._cur_frame = int(float(v))
+        self._request_render(recompute_track=False)
+
+    def _toggle_play(self):
+        self._playing = not self._playing
+        self.play_btn.configure(text="❚❚" if self._playing else "▶")
+        if self._playing:
+            self._tick_play()
+
+    def _tick_play(self):
+        if not self._playing:
+            return
+        if self._cur_frame >= self._total - 1:
+            self._cur_frame = 0
+        else:
+            self._cur_frame += 1
+        self._programmatic = True
+        self.scrub_var.set(self._cur_frame)
+        self._programmatic = False
+        self._render_current_frame()
+        # Preview cadence: target fps capped at 20 fps so PIL keeps up.
+        delay = max(50, int(1000 / min(self._fps_meta, 20)))
+        self.after(delay, self._tick_play)
+
+    # ── Export ─────────────────────────────────────────────────
     def export_mp4(self):
         if not self.bundle_path or not os.path.isdir(self.bundle_path):
-            messagebox.showinfo("No Recording","Record first then export.")
+            messagebox.showinfo("No Recording", "Record first then export.")
             return
         out = filedialog.asksaveasfilename(
             defaultextension=".mp4",
-            filetypes=[("MP4","*.mp4")],
+            filetypes=[("MP4", "*.mp4")],
             initialfile="screensee.mp4")
-        if not out: return
+        if not out:
+            return
         s = self._settings()
         bundle = self.bundle_path
+
         def run():
             p = Processor(s, progress_cb=self._on_progress)
             ok = p.run(bundle, out)
             if ok:
-                messagebox.showinfo("Exported!",f"Saved:\n{out}")
+                messagebox.showinfo("Exported!", f"Saved:\n{out}")
             else:
-                messagebox.showerror("Error",
-                    "Export failed.\nCheck that FFmpeg is on PATH and the bundle is valid.")
+                messagebox.showerror(
+                    "Error",
+                    "Export failed. Check that FFmpeg is on PATH "
+                    "and the bundle is valid.")
         threading.Thread(target=run, daemon=True).start()
 
     def _on_progress(self, pct, msg):
-        self.prog_var.set(pct/100)
-        self.status_var.set(msg)
+        if hasattr(self, "prog_var"):
+            self.prog_var.set(pct / 100)
+            self.status_var.set(msg)
 
-    # ── Preview
-    def open_preview(self):
-        if not self.bundle_path or not os.path.isdir(self.bundle_path):
-            messagebox.showinfo("No Data","Record first then preview.")
-            return
-
-        raw_path = os.path.join(self.bundle_path, "raw.mkv")
-        src = cv2.VideoCapture(raw_path)
-        if not src.isOpened():
-            messagebox.showerror("Preview", f"Failed to open {raw_path}")
-            return
-        total = int(src.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
-
-        win = ctk.CTkToplevel(self)
-        win.title("Live Preview")
-        win.geometry("720x520")
-        win.configure(fg_color="#0d1117")
-        win.protocol("WM_DELETE_WINDOW",
-                     lambda: (src.release(), win.destroy()))
-
-        PREV_W, PREV_H = 680, 380
-
-        img_lbl = ctk.CTkLabel(win, text="")
-        img_lbl.pack(pady=(12,4))
-
-        ctk.CTkLabel(win,
-                     text="Adjust sliders in main window — preview updates live",
-                     font=ctk.CTkFont("Segoe UI",10),
-                     text_color="#475569").pack()
-
-        # Scrubber
-        scr_row = ctk.CTkFrame(win, fg_color="transparent")
-        scr_row.pack(fill="x", padx=16, pady=6)
-        ctk.CTkLabel(scr_row, text="Frame",
-                     font=ctk.CTkFont("Segoe UI",10),
-                     text_color="#94a3b8").pack(side="left")
-        frame_var = ctk.IntVar(value=min(30, total-1))
-        scr = ctk.CTkSlider(scr_row,
-                             from_=0, to=max(1, total-1),
-                             variable=frame_var, width=560,
-                             button_color="#6366f1",
-                             button_hover_color="#8b5cf6",
-                             progress_color="#6366f1")
-        scr.pack(side="left", padx=8)
-
-        ctk.CTkButton(win, text="Close",
-                      width=100, height=32,
-                      fg_color="#1e2d4a", hover_color="#6366f1",
-                      command=lambda: (src.release(), win.destroy())
-                      ).pack(pady=(0,10))
-
-        win._img = None
-        win._last = None
-
-        def render(*_):
-            if not win.winfo_exists(): return
-            fi = int(frame_var.get())
-            s  = self._settings()
-            key = (fi, str(s))
-            if key == win._last: return
-            win._last = key
-
-            src.set(cv2.CAP_PROP_POS_FRAMES, fi)
-            ok, f = src.read()
-            if not ok: return
-            img = Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGBA))
-            preset = s["canvas_preset"]
-            if preset and preset != "Original":
-                cw,ch = CANVAS_PRESETS[preset]
-            else:
-                p2 = s["padding"]*2
-                cw = f.shape[1]+p2+60
-                ch = f.shape[0]+p2+60
-
-            cv_img,*_ = composite(img, cw, ch,
-                                   s["bg_type"], s["bg_val"],
-                                   s["padding"], s["inset"],
-                                   s["roundness"], s["shadow"])
-            asp = cw/ch
-            if asp > PREV_W/PREV_H:
-                pw=PREV_W; ph=int(PREV_W/asp)
-            else:
-                ph=PREV_H; pw=int(PREV_H*asp)
-            small = cv_img.resize((pw,ph), Image.LANCZOS)
-            lb = Image.new("RGBA",(PREV_W,PREV_H),(10,10,20,255))
-            lb.paste(small,((PREV_W-pw)//2,(PREV_H-ph)//2))
-            tk_img = ImageTk.PhotoImage(lb)
-            img_lbl.configure(image=tk_img)
-            win._img = tk_img
-
-        scr.configure(command=render)
-        render()
-
-        def poll():
-            if win.winfo_exists():
-                render(); win.after(250, poll)
-        win.after(250, poll)
-
+    # ── close ─────────────────────────────────────────────────
+    def _on_close(self):
+        self._playing = False
+        if self._preview_src:
+            try: self._preview_src.release()
+            except Exception: pass
+        if self.recording:
+            try: self.recorder.stop()
+            except Exception: pass
+        self.destroy()
 
 # ============================================================
 if __name__ == "__main__":
