@@ -38,7 +38,7 @@ except ImportError:
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-VERSION  = "3.2"
+VERSION  = "3.3"
 APP_NAME = "ScreenSee"
 
 CANVAS_PRESETS = {
@@ -199,7 +199,7 @@ class ZoomEngine:
         t = max(0.0, min(1.0, t))
         return t * t * t
 
-    def trigger(self, nx, ny, z=2.0, t=None, in_dur=0.25):
+    def trigger(self, nx, ny, z=2.0, t=None, in_dur=0.5):
         """Zoom in — only starts new animation if target changed"""
         if (self._target_zoom == z and
             abs(self._target_cx - nx) < 0.01 and
@@ -211,13 +211,13 @@ class ZoomEngine:
             "scy": self.cy, "ecy": ny,
             "t0": t or time.time(),
             "dur": in_dur,
-            "ease": self._ease_out_cubic
+            "ease": self._ease_in_out_cubic,
         }
         self._target_zoom = z
         self._target_cx   = nx
         self._target_cy   = ny
 
-    def release(self, t=None, out_dur=0.35):
+    def release(self, t=None, out_dur=0.8):
         """Zoom out — only starts new animation if not already zooming out"""
         if self._target_zoom <= 1.02:
             return  # already released or releasing
@@ -227,7 +227,7 @@ class ZoomEngine:
             "scy": self.cy, "ecy": 0.5,
             "t0": t or time.time(),
             "dur": out_dur,
-            "ease": self._ease_in_out_cubic
+            "ease": self._ease_in_out_cubic,
         }
         self._target_zoom = 1.0
         self._target_cx   = 0.5
@@ -421,6 +421,11 @@ def precompute_track(events, meta, s):
         damping  =s["damping"]*90.0,
         mass=3.0, fps=fps)
     zoom_eng = ZoomEngine(fps=fps)
+    # Separate, gentler spring for the zoom-camera centre. FocuSee's
+    # screenMovementSpring constants — overdamped, ~0.5s settle — so the
+    # camera slowly follows the cursor instead of locking to the click.
+    screen = MassSpringDamper(stiffness=170.0, damping=50.0,
+                              mass=3.0, fps=fps)
 
     evs = sorted([
         (e["t"], e["type"], e["x"]-reg["left"], e["y"]-reg["top"])
@@ -483,12 +488,20 @@ def precompute_track(events, meta, s):
         else:
             cur_opacity = 1.0
 
-        active = next((z for z in zoom_wins if z["s"] <= tf <= z["e"]), None)
+        active = next((zw for zw in zoom_wins if zw["s"] <= tf <= zw["e"]),
+                      None)
         if active:
-            zoom_eng.trigger(active["nx"], active["ny"], active["z"], t=tf)
+            # Zoom level animates with ease-in-out via ZoomEngine. The centre
+            # is driven separately by `screen` against the live cursor so the
+            # camera pans to keep the pointer in frame instead of clamping
+            # to where the click happened.
+            zoom_eng.trigger(0.5, 0.5, active["z"], t=tf)
+            target_cx, target_cy = sx / sw, sy / sh
         else:
             zoom_eng.release(t=tf)
-        z, zcx, zcy = zoom_eng.update(t=tf)
+            target_cx, target_cy = 0.5, 0.5
+        z = zoom_eng.update(t=tf)[0]
+        zcx, zcy = screen.update(target_cx, target_cy, t=tf)
 
         active_rips = [
             (rx, ry, tf - rt, ripple_dur)
