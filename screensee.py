@@ -38,7 +38,7 @@ except ImportError:
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-VERSION  = "3.6"
+VERSION  = "3.7"
 APP_NAME = "ScreenSee"
 
 CANVAS_PRESETS = {
@@ -350,7 +350,7 @@ def make_canvas(cw, ch, bg_type, bg_val,
 
 
 def composite(rec_pil, cw, ch, bg_type, bg_val,
-              padding, inset, roundness, shadow):
+              padding, inset, roundness, shadow, glass=0):
     rw, rh = rec_pil.size
     avail_w = cw - padding*2
     avail_h = ch - padding*2
@@ -372,6 +372,30 @@ def composite(rec_pil, cw, ch, bg_type, bg_val,
             radius=roundness, fill=(0,0,0,alp))
         sl = sl.filter(ImageFilter.GaussianBlur(max(2,shadow//6)))
         canvas = Image.alpha_composite(canvas, sl)
+
+    # Glass halo — translucent frosted plate behind the recording.
+    # Shares the recording's roundness so it reads as a window frame.
+    if glass > 0:
+        gx, gy = rx - glass, ry - glass
+        gw, gh = ow + glass*2, oh + glass*2
+        gr     = roundness + glass // 2
+        glass_layer = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+        gd = ImageDraw.Draw(glass_layer)
+        # Soft fill: very translucent white, blurred for a frosted look.
+        gd.rounded_rectangle([gx, gy, gx+gw, gy+gh],
+                             radius=gr,
+                             fill=(255, 255, 255, 35))
+        glass_layer = glass_layer.filter(
+            ImageFilter.GaussianBlur(max(2, glass // 2)))
+        # Crisper bright edge so the halo reads as a glass rim.
+        rim = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+        ImageDraw.Draw(rim).rounded_rectangle(
+            [gx, gy, gx+gw, gy+gh],
+            radius=gr,
+            outline=(255, 255, 255, 90),
+            width=max(1, glass // 6))
+        glass_layer = Image.alpha_composite(glass_layer, rim)
+        canvas = Image.alpha_composite(canvas, glass_layer)
 
     rec_r = rec_pil.convert("RGBA").resize((ow,oh), Image.LANCZOS)
 
@@ -416,10 +440,16 @@ def precompute_track(events, meta, s):
     if n <= 0:
         return []
 
-    smoother = MassSpringDamper(
-        stiffness=s["stiffness"]*1200.0,
-        damping  =s["damping"]*90.0,
-        mass=3.0, fps=fps)
+    # Smoothness=0 bypasses the spring entirely so the synthetic cursor
+    # lands exactly where pynput recorded the event — no lag. The spring
+    # still applies for stylised motion when Smoothness > 0.
+    use_spring = s["stiffness"] > 0.001
+    smoother = (
+        MassSpringDamper(stiffness=s["stiffness"]*1200.0,
+                          damping  =s["damping"]*90.0,
+                          mass=3.0, fps=fps)
+        if use_spring else None
+    )
     zoom_eng = ZoomEngine(fps=fps)
     # Separate, gentler spring for the zoom-camera centre. Tuned for a
     # Screen-Studio-style premium pan: ~1 s to settle, slightly
@@ -449,6 +479,7 @@ def precompute_track(events, meta, s):
 
     track       = []
     cur_x, cur_y = sw//2, sh//2
+    prev_x, prev_y = cur_x, cur_y
     pressed     = False
     last_press_t = -1.0
     cur_opacity = 1.0
@@ -472,12 +503,18 @@ def precompute_track(events, meta, s):
                 pressed = False
             ev_i += 1
 
-        sx, sy = smoother.update(cur_x, cur_y, t=tf)
-        spd    = math.sqrt(smoother.vx**2 + smoother.vy**2)
+        if use_spring:
+            sx, sy = smoother.update(cur_x, cur_y, t=tf)
+            spd    = math.sqrt(smoother.vx**2 + smoother.vy**2)
+        else:
+            sx, sy = cur_x, cur_y
+            # Velocity from raw cursor deltas — keeps auto-hide working
+            # in the bypassed-spring path.
+            spd = math.hypot((cur_x - prev_x) * fps,
+                             (cur_y - prev_y) * fps)
+        prev_x, prev_y = cur_x, cur_y
 
         tilt = 0.0
-        if s["cursor_tilt"] and spd > 0.5:
-            tilt = math.atan2(smoother.vy, smoother.vx)*(180/math.pi)*0.15
 
         if s["auto_hide"]:
             if spd < 0.5:
@@ -520,6 +557,21 @@ def precompute_track(events, meta, s):
             "pressed": pressed, "dragging": dragging,
             "ripples": active_rips,
         })
+
+    # Loop cursor position — Screen Studio's "return to start" trick. Over
+    # the last ~0.8s of the clip, ease the smoothed cursor coords back to
+    # where the recording opened, so a looping clip doesn't snap.
+    if s.get("loop_cursor") and len(track) > 4:
+        loop_frames = min(int(0.8 * fps), len(track) - 1)
+        start_sx = track[0]["sx"]
+        start_sy = track[0]["sy"]
+        for i in range(loop_frames):
+            fi_loop = len(track) - loop_frames + i
+            u  = (i + 1) / loop_frames
+            ea = 1.0 - (1.0 - u) ** 3   # ease-out cubic
+            e  = track[fi_loop]
+            e["sx"] = e["sx"] * (1.0 - ea) + start_sx * ea
+            e["sy"] = e["sy"] * (1.0 - ea) + start_sy * ea
 
     return track
 
@@ -583,7 +635,8 @@ def render_frame(raw_bgr, st, s, sw, sh, cw, ch):
         img, cw, ch,
         s["bg_type"], s["bg_val"],
         s["padding"], s["inset"],
-        s["roundness"], s["shadow"])
+        s["roundness"], s["shadow"],
+        glass=s.get("glass", 0))
     return canvas
 
 
@@ -945,7 +998,6 @@ class App(ctk.CTk):
         # Hidden defaults (controls dropped from UI)
         self._inset       = 0
         self._cursor_tilt = False   # rotation moves the tip off-target
-        self._auto_hide   = True
         # Hold ~1 s at peak zoom AFTER the 1 s ease-in, so a click looks
         # like: 1 s zoom in → 1 s held → 1.4 s ease out.
         self._zoom_dur    = 2.0
@@ -978,15 +1030,20 @@ class App(ctk.CTk):
         self.roundness_var    = ctk.DoubleVar(value=14)
         self.shadow_var       = ctk.DoubleVar(value=70)
         self.cursor_size_var  = ctk.DoubleVar(value=36)
-        self.smooth_var       = ctk.DoubleVar(value=0.35)
+        self.glass_var        = ctk.DoubleVar(value=14)
+        self.smooth_var       = ctk.DoubleVar(value=0.0)
         self.ripple_var       = ctk.BooleanVar(value=True)
         self.show_cursor_var  = ctk.BooleanVar(value=True)
+        self.autohide_var     = ctk.BooleanVar(value=True)
+        self.loop_cursor_var  = ctk.BooleanVar(value=False)
         self.autozoom_var     = ctk.BooleanVar(value=True)
         self.zoomlevel_var    = ctk.DoubleVar(value=2.0)
 
         for v in (self.canvas_var, self.padding_var, self.roundness_var,
-                  self.shadow_var, self.cursor_size_var, self.smooth_var,
+                  self.shadow_var, self.glass_var,
+                  self.cursor_size_var, self.smooth_var,
                   self.ripple_var, self.show_cursor_var,
+                  self.autohide_var, self.loop_cursor_var,
                   self.autozoom_var, self.zoomlevel_var):
             v.trace_add("write", lambda *a: self._request_render())
 
@@ -1082,26 +1139,20 @@ class App(ctk.CTk):
                      font=ctk.CTkFont("Segoe UI", 10),
                      text_color="#5e5e75").pack(pady=(36, 6))
 
-        # Backend chip — amber when on mss because the OS cursor will be
-        # baked into the raw footage and you'll see two cursors in preview.
+        # Backend chip. Both paths produce cursor-free frames on Windows
+        # (WGC with cursor_capture=False, mss via BitBlt which never
+        # captures the cursor). WGC is just GPU-accelerated; mss is a
+        # fine software fallback.
         chip_frame = ctk.CTkFrame(center, fg_color=self.PANEL_2,
                                    corner_radius=6)
         chip_frame.pack()
-        if HAS_WGC:
-            ctk.CTkLabel(
-                chip_frame, text="● Capture: WGC  (cursor excluded)",
-                font=ctk.CTkFont("Segoe UI", 10, weight="bold"),
-                text_color="#22c55e",
-            ).pack(padx=12, pady=4)
-        else:
-            ctk.CTkLabel(
-                chip_frame,
-                text=("⚠  Capture: mss fallback — OS cursor will be in the "
-                      "raw footage (you'll see two cursors).\n"
-                      "Run:  pip install windows-capture"),
-                font=ctk.CTkFont("Segoe UI", 10, weight="bold"),
-                text_color="#f59e0b", justify="left",
-            ).pack(padx=12, pady=6)
+        ctk.CTkLabel(
+            chip_frame,
+            text=("● Capture: WGC  (hardware, cursor excluded)" if HAS_WGC
+                  else "● Capture: mss  (software fallback, cursor excluded)"),
+            font=ctk.CTkFont("Segoe UI", 10, weight="bold"),
+            text_color="#22c55e" if HAS_WGC else "#60a5fa",
+        ).pack(padx=12, pady=4)
 
         self.welcome_status = ctk.CTkLabel(
             center, text="",
@@ -1262,14 +1313,17 @@ class App(ctk.CTk):
         self._slider(parent, "Padding",   self.padding_var,   0, 160)
         self._slider(parent, "Roundness", self.roundness_var, 0, 40)
         self._slider(parent, "Shadow",    self.shadow_var,    0, 100)
+        self._slider(parent, "Glass halo", self.glass_var,    0, 40)
 
         # CURSOR
         self._section(parent, "CURSOR")
-        self._toggle(parent, "Cursor overlay", self.show_cursor_var)
-        self._slider(parent, "Size",       self.cursor_size_var, 16, 64)
-        self._slider(parent, "Smoothness", self.smooth_var, 0.0, 1.0,
+        self._toggle(parent, "Cursor overlay",   self.show_cursor_var)
+        self._slider(parent, "Size",             self.cursor_size_var, 16, 64)
+        self._slider(parent, "Smoothness",       self.smooth_var, 0.0, 1.0,
                      fmt=lambda v: f"{float(v):.2f}")
-        self._toggle(parent, "Click ripples", self.ripple_var)
+        self._toggle(parent, "Auto-hide idle",   self.autohide_var)
+        self._toggle(parent, "Click ripples",    self.ripple_var)
+        self._toggle(parent, "Loop to start",    self.loop_cursor_var)
 
         # AUTO ZOOM
         self._section(parent, "AUTO ZOOM")
@@ -1304,12 +1358,17 @@ class App(ctk.CTk):
     # ── settings dict (single source of truth for render+export)
     def _settings(self):
         smooth = float(self.smooth_var.get())
-        # Map Smoothness 0..1 to absolute FocuSee-style spring constants.
-        # 0 → k=470 (FocuSee default, snappy)   1 → k=120 (very gentle).
+        # Smoothness 0 → spring bypassed entirely (exact cursor follow).
+        # Above ~0.05 we map onto FocuSee-style spring constants:
+        #   0.05 → k≈452 (snappy), 1.0 → k=120 (very gentle).
         # Damping is always 0.92 of critical so the cursor catches up
-        # quickly without ringing.
-        k = 470.0 - smooth * 350.0
-        b = 2.0 * math.sqrt(k * 3.0) * 0.92
+        # without ringing.
+        if smooth < 0.05:
+            k = 0.0
+            b = 0.0
+        else:
+            k = 470.0 - smooth * 350.0
+            b = 2.0 * math.sqrt(k * 3.0) * 0.92
         return {
             "fps":           int(self.fps_var.get()),
             "region":        {"left": 0, "top": 0,
@@ -1319,6 +1378,7 @@ class App(ctk.CTk):
             "inset":         self._inset,
             "roundness":     int(self.roundness_var.get()),
             "shadow":        int(self.shadow_var.get()),
+            "glass":         int(self.glass_var.get()),
             "bg_type":       self.bg_type,
             "bg_val":        self.bg_val,
             "cursor_size":   int(self.cursor_size_var.get()),
@@ -1327,7 +1387,8 @@ class App(ctk.CTk):
             "cursor_tilt":   self._cursor_tilt,
             "show_cursor":   self.show_cursor_var.get(),
             "click_ripple":  self.ripple_var.get(),
-            "auto_hide":     self._auto_hide,
+            "auto_hide":     self.autohide_var.get(),
+            "loop_cursor":   self.loop_cursor_var.get(),
             "auto_zoom":     self.autozoom_var.get(),
             "zoom_level":    float(self.zoomlevel_var.get()),
             "zoom_dur":      self._zoom_dur,
@@ -1387,17 +1448,10 @@ class App(ctk.CTk):
                     "recording will work).")
                 self.bundle_path = None
                 return
-            # WGC advertised on the welcome chip but mss actually ran:
-            # surface that once so the user knows why the OS cursor is
-            # still in the raw footage.
-            if HAS_WGC and backend != "windows-capture":
-                messagebox.showwarning(
-                    "Fell back to mss",
-                    "Windows.Graphics.Capture refused to start on this "
-                    "build (it doesn't allow toggling the capture "
-                    "border). Recorded with mss instead — the OS cursor "
-                    "is in the raw footage and will appear under the "
-                    "synthetic cursor.")
+            # No dialog when WGC silently fell back to mss — on Windows
+            # both paths produce cursor-free frames, so it's not a
+            # downgrade as far as the cursor overlay is concerned. WGC
+            # is just faster.
             self._show_editor()
 
     def _tick(self):
@@ -1448,13 +1502,6 @@ class App(ctk.CTk):
         self.scrub.configure(to=max(1, self._total - 1))
         self._programmatic = True
         self.scrub_var.set(0)
-        # When the bundle came from the mss backend, the OS cursor is
-        # already baked into raw.mkv. Drawing the synthetic cursor on top
-        # produces a visibly lagging double-cursor — default the overlay
-        # off so the real cursor is what the user sees. They can flip it
-        # back on in the sidebar.
-        backend = self._meta.get("backend", "")
-        self.show_cursor_var.set(backend != "mss")
         self._programmatic = False
         self._track_key = None
         self._request_render()
