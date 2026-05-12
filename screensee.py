@@ -38,7 +38,7 @@ except ImportError:
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-VERSION  = "3.4"
+VERSION  = "3.5"
 APP_NAME = "ScreenSee"
 
 CANVAS_PRESETS = {
@@ -750,8 +750,21 @@ class Recorder:
         self._t0 = time.perf_counter()
         self.running = True
 
+        # WGC may import fine but fail at session start on some Windows
+        # builds ("Toggling the capture border is not supported"). When
+        # that happens we transparently take the mss path so recording
+        # still works — at the cost of the OS cursor appearing in the
+        # raw footage. self._active_backend reflects what actually ran.
+        self._active_backend = "mss"
         if HAS_WGC:
-            self._start_wgc(region)
+            try:
+                self._start_wgc(region)
+                self._active_backend = "windows-capture"
+            except Exception as e:
+                print(f"[ScreenSee] WGC start failed: {e}\n"
+                      f"[ScreenSee] Falling back to mss capture.")
+                self._capture = None
+                self._start_mss(region)
         else:
             self._start_mss(region)
 
@@ -793,8 +806,8 @@ class Recorder:
                 "frame_count": self._frame_idx,
                 "frame_times": self._frame_times,
                 "duration": self._now(),
-                "cursor_excluded": HAS_WGC,
-                "backend": "windows-capture" if HAS_WGC else "mss",
+                "cursor_excluded": self._active_backend == "windows-capture",
+                "backend": self._active_backend,
             }, f)
         return self.bundle_path
 
@@ -1346,19 +1359,19 @@ class App(ctk.CTk):
             # to load the bundle into the editor — otherwise we end up
             # opening a malformed raw.mkv and showing a black preview.
             frame_count = 0
+            backend = "mss"
             try:
                 with open(os.path.join(self.bundle_path,
                                        "meta.json")) as f:
-                    frame_count = json.load(f).get("frame_count", 0)
+                    meta = json.load(f)
+                frame_count = meta.get("frame_count", 0)
+                backend     = meta.get("backend", "mss")
             except Exception:
                 pass
             if frame_count < 5:
                 messagebox.showerror(
                     "Recording failed",
                     "No frames were captured.\n\n"
-                    "The WGC capture session likely failed silently. "
-                    "Check the console for a 'Capture session threw an "
-                    "exception' message.\n\n"
                     "Workarounds:\n"
                     "  • Update Windows to the latest build, or\n"
                     "  • pip uninstall windows-capture   (forces the "
@@ -1366,6 +1379,17 @@ class App(ctk.CTk):
                     "recording will work).")
                 self.bundle_path = None
                 return
+            # WGC advertised on the welcome chip but mss actually ran:
+            # surface that once so the user knows why the OS cursor is
+            # still in the raw footage.
+            if HAS_WGC and backend != "windows-capture":
+                messagebox.showwarning(
+                    "Fell back to mss",
+                    "Windows.Graphics.Capture refused to start on this "
+                    "build (it doesn't allow toggling the capture "
+                    "border). Recorded with mss instead — the OS cursor "
+                    "is in the raw footage and will appear under the "
+                    "synthetic cursor.")
             self._show_editor()
 
     def _tick(self):
