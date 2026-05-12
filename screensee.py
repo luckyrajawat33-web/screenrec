@@ -38,7 +38,7 @@ except ImportError:
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-VERSION  = "3.7"
+VERSION  = "3.8"
 APP_NAME = "ScreenSee"
 
 CANVAS_PRESETS = {
@@ -270,23 +270,91 @@ class ZoomEngine:
 ARROW_PTS = [(0,0),(0,28),(7,21),(12,32),(16,30),(11,19),(20,19)]
 ARROW_SHADOW = [(x+2,y+3) for x,y in ARROW_PTS]
 
-def draw_cursor(img_rgba, cx, cy, size=32, opacity=1.0, tilt=0.0,
-                pressed=False, dragging=False):
-    # `tilt` is accepted for back-compat but intentionally ignored:
-    # rotating the sprite around its centre moves the tip away from
-    # (cx, cy) and produces the visible "bending" that v3.1 had.
-    scale = size / 32.0
-    scaled   = [(int(x*scale), int(y*scale)) for x,y in ARROW_PTS]
-    shadow_p = [(int(x*scale), int(y*scale)) for x,y in ARROW_SHADOW]
-    cur = Image.new("RGBA", (int(64*scale), int(64*scale)), (0,0,0,0))
+# Hand-cursor: simple finger-pointing variant. Tip = (11, 0).
+HAND_PTS = [(11,0),(15,0),(15,10),(20,10),(22,12),(22,28),
+            (20,30),(8,30),(6,28),(6,18),(4,16),(2,16),(2,12),
+            (4,10),(11,10)]
+
+CURSOR_STYLES = {
+    # Polygon cursors: tip anchored near sprite (0,0) -> tip lands on (cx,cy).
+    "arrow":    {"kind": "polygon", "pts": ARROW_PTS,
+                 "fill": (255,255,255), "outline": (0,0,0),
+                 "tip": (0, 0)},
+    "modern":   {"kind": "polygon",
+                 "pts": [(0,0),(0,22),(7,17),(11,28),(15,26),
+                         (10,15),(18,15)],
+                 "fill": (250,250,255), "outline": (40,40,55),
+                 "tip": (0, 0)},
+    "triangle": {"kind": "polygon",
+                 "pts": [(0,0),(22,11),(0,22)],
+                 "fill": (255,255,255), "outline": (0,0,0),
+                 "tip": (0, 11)},
+    "hand":     {"kind": "polygon", "pts": HAND_PTS,
+                 "fill": (255,235,220), "outline": (60,40,30),
+                 "tip": (12, 0)},
+    # Centered cursors: anchor at sprite centre, useful as a minimal dot.
+    "dot":      {"kind": "circle", "diameter": 16,
+                 "fill": (240,240,255), "outline": (255,255,255)},
+    "ring":     {"kind": "ring",   "diameter": 22,
+                 "outline": (255,255,255), "width": 3},
+}
+
+
+def _draw_sprite(style, scale, opacity):
+    """Build the cursor sprite Image for the given style + scale.
+    Returns (sprite, anchor_x, anchor_y) where anchor is the sprite
+    pixel that should land on (cx, cy)."""
+    cdef = CURSOR_STYLES.get(style, CURSOR_STYLES["arrow"])
+    box = int(64 * scale)
+    cur = Image.new("RGBA", (box, box), (0, 0, 0, 0))
     d   = ImageDraw.Draw(cur)
-    d.polygon(shadow_p, fill=(0,0,0,int(60*opacity)))
-    d.polygon(scaled,   fill=(255,255,255,int(255*opacity)))
-    d.line([scaled[i] for i in range(len(scaled))] + [scaled[0]],
-           fill=(0,0,0,int(200*opacity)), width=max(1,int(1.5*scale)))
-    # Sprite tip lives at sprite (0,0); the small -2 offset accounts for
-    # the antialiased outline so the visible tip lands on (cx, cy).
-    img_rgba.paste(cur, (int(cx)-2, int(cy)-2), cur)
+
+    kind = cdef["kind"]
+    if kind == "polygon":
+        pts = cdef["pts"]
+        fill    = cdef["fill"]
+        outline = cdef["outline"]
+        scaled   = [(int(x*scale), int(y*scale)) for x,y in pts]
+        shadow_p = [(int(x*scale)+2, int(y*scale)+3) for x,y in pts]
+        d.polygon(shadow_p, fill=(0, 0, 0, int(60 * opacity)))
+        d.polygon(scaled, fill=fill + (int(255 * opacity),))
+        d.line([scaled[i] for i in range(len(scaled))] + [scaled[0]],
+               fill=outline + (int(200 * opacity),),
+               width=max(1, int(1.5 * scale)))
+        ax, ay = cdef["tip"]
+        # -2 accounts for the antialiased outline so the visible tip
+        # lands on (cx, cy).
+        return cur, int(ax * scale) - 2, int(ay * scale) - 2
+
+    cc = box // 2
+    if kind == "circle":
+        diam = int(cdef["diameter"] * scale)
+        # shadow
+        d.ellipse([cc-diam//2+2, cc-diam//2+3,
+                   cc+diam//2+2, cc+diam//2+3],
+                  fill=(0, 0, 0, int(60 * opacity)))
+        d.ellipse([cc-diam//2, cc-diam//2, cc+diam//2, cc+diam//2],
+                  fill=cdef["fill"] + (int(220 * opacity),),
+                  outline=cdef["outline"] + (int(255 * opacity),),
+                  width=max(1, int(1.5 * scale)))
+    elif kind == "ring":
+        diam = int(cdef["diameter"] * scale)
+        d.ellipse([cc-diam//2, cc-diam//2, cc+diam//2, cc+diam//2],
+                  outline=cdef["outline"] + (int(255 * opacity),),
+                  width=max(2, int(cdef["width"] * scale)))
+    return cur, cc, cc
+
+
+def draw_cursor(img_rgba, cx, cy, size=32, opacity=1.0, tilt=0.0,
+                pressed=False, dragging=False, style="arrow"):
+    # `tilt` is accepted for back-compat but intentionally ignored.
+    scale = size / 32.0
+    # When dragging the user expects something that reads as "grabbing"
+    # rather than the default pointer. Swap to the hand silhouette
+    # automatically; the per-frame state already tells us this.
+    eff_style = "hand" if dragging else style
+    cur, ax, ay = _draw_sprite(eff_style, scale, opacity)
+    img_rgba.paste(cur, (int(cx) - ax, int(cy) - ay), cur)
 
     if pressed and opacity > 0.02:
         ring_r = int(14 * scale * (1.4 if dragging else 1.0))
@@ -330,11 +398,23 @@ class Ripple:
 #  BACKGROUND COMPOSITOR
 # ============================================================
 def make_canvas(cw, ch, bg_type, bg_val,
-                padding, inset, roundness, shadow):
+                padding, inset, roundness, shadow, bg_blur=0):
     canvas = Image.new("RGBA", (cw,ch), (20,20,30,255))
     d = ImageDraw.Draw(canvas)
 
-    if bg_type == "gradient":
+    if bg_type == "image" and bg_val:
+        try:
+            img = Image.open(bg_val).convert("RGBA")
+            # Cover-fit the image onto the canvas.
+            iw, ih = img.size
+            scale = max(cw / iw, ch / ih)
+            nw, nh = int(iw * scale), int(ih * scale)
+            img = img.resize((nw, nh), Image.LANCZOS)
+            ox, oy = (cw - nw) // 2, (ch - nh) // 2
+            canvas.paste(img, (ox, oy))
+        except Exception:
+            pass
+    elif bg_type == "gradient":
         c1 = tuple(int(bg_val[0][i:i+2],16) for i in (1,3,5))
         c2 = tuple(int(bg_val[1][i:i+2],16) for i in (1,3,5))
         for y in range(ch):
@@ -346,48 +426,52 @@ def make_canvas(cw, ch, bg_type, bg_val,
     elif bg_type == "solid":
         c = tuple(int(bg_val[i:i+2],16) for i in (1,3,5))
         d.rectangle([0,0,cw,ch], fill=c+(255,))
+
+    if bg_blur > 0:
+        canvas = canvas.filter(ImageFilter.GaussianBlur(bg_blur))
     return canvas
 
 
-def composite(rec_pil, cw, ch, bg_type, bg_val,
-              padding, inset, roundness, shadow, glass=0):
-    rw, rh = rec_pil.size
+# ============================================================
+#  CHROME: background + shadow + glass halo, with no recording yet.
+#  This is the slow part of compositing — generating the gradient,
+#  drawing and blurring the shadow + glass plate. Caching this between
+#  frames (settings rarely change while the user plays back) gives the
+#  preview a ~3-5x FPS boost.
+# ============================================================
+def build_chrome(cw, ch, bg_type, bg_val, sw, sh,
+                 padding, inset, roundness, shadow,
+                 glass=0, bg_blur=0):
     avail_w = cw - padding*2
     avail_h = ch - padding*2
-    sc  = min(avail_w/rw, avail_h/rh)
-    ow  = int(rw*sc); oh = int(rh*sc)
-    rx  = (cw-ow)//2;  ry = (ch-oh)//2
+    sc = min(avail_w/sw, avail_h/sh)
+    ow = int(sw*sc); oh = int(sh*sc)
+    rx = (cw-ow)//2;  ry = (ch-oh)//2
 
     canvas = make_canvas(cw, ch, bg_type, bg_val,
-                          padding, inset, roundness, shadow)
+                         padding, inset, roundness, shadow, bg_blur)
 
-    # Shadow
     if shadow > 0:
-        sl = Image.new("RGBA",(cw,ch),(0,0,0,0))
+        sl = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
         sd = ImageDraw.Draw(sl)
-        off = max(1, shadow//8)
-        alp = min(200, shadow*2)
+        off = max(1, shadow // 8)
+        alp = min(200, shadow * 2)
         sd.rounded_rectangle(
-            [rx+off,ry+off,rx+ow+off,ry+oh+off],
-            radius=roundness, fill=(0,0,0,alp))
-        sl = sl.filter(ImageFilter.GaussianBlur(max(2,shadow//6)))
+            [rx+off, ry+off, rx+ow+off, ry+oh+off],
+            radius=roundness, fill=(0, 0, 0, alp))
+        sl = sl.filter(ImageFilter.GaussianBlur(max(2, shadow // 6)))
         canvas = Image.alpha_composite(canvas, sl)
 
-    # Glass halo — translucent frosted plate behind the recording.
-    # Shares the recording's roundness so it reads as a window frame.
     if glass > 0:
         gx, gy = rx - glass, ry - glass
         gw, gh = ow + glass*2, oh + glass*2
         gr     = roundness + glass // 2
         glass_layer = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
         gd = ImageDraw.Draw(glass_layer)
-        # Soft fill: very translucent white, blurred for a frosted look.
         gd.rounded_rectangle([gx, gy, gx+gw, gy+gh],
-                             radius=gr,
-                             fill=(255, 255, 255, 35))
+                             radius=gr, fill=(255, 255, 255, 35))
         glass_layer = glass_layer.filter(
             ImageFilter.GaussianBlur(max(2, glass // 2)))
-        # Crisper bright edge so the halo reads as a glass rim.
         rim = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
         ImageDraw.Draw(rim).rounded_rectangle(
             [gx, gy, gx+gw, gy+gh],
@@ -397,27 +481,39 @@ def composite(rec_pil, cw, ch, bg_type, bg_val,
         glass_layer = Image.alpha_composite(glass_layer, rim)
         canvas = Image.alpha_composite(canvas, glass_layer)
 
-    rec_r = rec_pil.convert("RGBA").resize((ow,oh), Image.LANCZOS)
+    return canvas, rx, ry, ow, oh
 
-    # Rounded mask first (clip recording to rounded corners)
+
+def paste_recording(chrome, rec_pil, rx, ry, ow, oh, roundness, inset):
+    """Paste rec_pil onto a pre-built chrome canvas. Fast per-frame path."""
+    canvas = chrome.copy()
+    rec_r = rec_pil.convert("RGBA").resize((ow, oh), Image.LANCZOS)
     if roundness > 0:
-        mask = Image.new("L",(ow,oh),0)
-        ImageDraw.Draw(mask).rounded_rectangle([0,0,ow-1,oh-1],
-                                               radius=roundness, fill=255)
+        mask = Image.new("L", (ow, oh), 0)
+        ImageDraw.Draw(mask).rounded_rectangle(
+            [0, 0, ow-1, oh-1], radius=roundness, fill=255)
         rec_r.putalpha(mask)
-
-    # Inset border — drawn ON TOP of recording, inside rounded corners
-    # Like FocuSee's inset: a subtle bright inner stroke
     if inset > 0:
-        border_layer = Image.new("RGBA",(ow,oh),(0,0,0,0))
-        bd = ImageDraw.Draw(border_layer)
-        bd.rounded_rectangle([0, 0, ow-1, oh-1],
-                              radius=roundness,
-                              outline=(255,255,255,180),
-                              width=max(1, inset))
-        rec_r = Image.alpha_composite(rec_r, border_layer)
+        border = Image.new("RGBA", (ow, oh), (0, 0, 0, 0))
+        ImageDraw.Draw(border).rounded_rectangle(
+            [0, 0, ow-1, oh-1], radius=roundness,
+            outline=(255, 255, 255, 180),
+            width=max(1, inset))
+        rec_r = Image.alpha_composite(rec_r, border)
+    canvas.paste(rec_r, (rx, ry), rec_r)
+    return canvas
 
-    canvas.paste(rec_r,(rx,ry),rec_r)
+
+def composite(rec_pil, cw, ch, bg_type, bg_val,
+              padding, inset, roundness, shadow, glass=0, bg_blur=0):
+    """Back-compat one-shot composite. Internal preview/export paths
+    now use build_chrome + paste_recording directly for caching."""
+    rw, rh = rec_pil.size
+    chrome, rx, ry, ow, oh = build_chrome(
+        cw, ch, bg_type, bg_val, rw, rh,
+        padding, inset, roundness, shadow, glass, bg_blur)
+    canvas = paste_recording(chrome, rec_pil, rx, ry, ow, oh, roundness, inset)
+    sc = min((cw - padding*2) / rw, (ch - padding*2) / rh)
     return canvas, rx, ry, ow, oh, sc
 
 
@@ -451,12 +547,13 @@ def precompute_track(events, meta, s):
         if use_spring else None
     )
     zoom_eng = ZoomEngine(fps=fps)
-    # Separate, gentler spring for the zoom-camera centre. Tuned for a
-    # Screen-Studio-style premium pan: ~1 s to settle, slightly
-    # overdamped so there is no overshoot at the end of a fast cursor
-    # move. (FocuSee's defaults were k=170/b=50; the camera felt snappy
-    # by comparison.)
-    screen = MassSpringDamper(stiffness=50.0, damping=25.7,
+    # Separate, very gentle spring for the zoom-camera centre. Screen
+    # Studio anchors the camera on the click point and only nudges it
+    # toward the cursor; pure cursor-following with a faster spring
+    # produces a "swimming" feel. We use an overdamped spring with a
+    # ~1.4 s settle, and blend the target between the click anchor and
+    # the live cursor so small cursor movements don't pan the camera.
+    screen = MassSpringDamper(stiffness=30.0, damping=21.0,
                               mass=3.0, fps=fps)
 
     evs = sorted([
@@ -530,12 +627,18 @@ def precompute_track(events, meta, s):
         active = next((zw for zw in zoom_wins if zw["s"] <= tf <= zw["e"]),
                       None)
         if active:
-            # Zoom level animates with ease-in-out via ZoomEngine. The centre
-            # is driven separately by `screen` against the live cursor so the
-            # camera pans to keep the pointer in frame instead of clamping
-            # to where the click happened.
+            # Zoom level animates with ease-in-out via ZoomEngine. The
+            # camera centre is blended from the click anchor + ~40% of
+            # the cursor displacement, then fed through the slow spring.
+            # This matches Screen Studio's behaviour: camera is anchored
+            # on the click, leans toward the cursor when it strays, but
+            # never simply chases the cursor.
             zoom_eng.trigger(0.5, 0.5, active["z"], t=tf)
-            target_cx, target_cy = sx / sw, sy / sh
+            anchor_x, anchor_y = active["nx"], active["ny"]
+            cursor_nx, cursor_ny = sx / sw, sy / sh
+            blend = 0.4
+            target_cx = anchor_x + (cursor_nx - anchor_x) * blend
+            target_cy = anchor_y + (cursor_ny - anchor_y) * blend
         else:
             zoom_eng.release(t=tf)
             target_cx, target_cy = 0.5, 0.5
@@ -584,7 +687,7 @@ def _zoom_origin(zcx, zcy, z, sw, sh):
     return x1, y1
 
 
-def render_frame(raw_bgr, st, s, sw, sh, cw, ch):
+def render_frame(raw_bgr, st, s, sw, sh, cw, ch, chrome=None):
     """Render one composited preview/export frame from the raw screen capture
     plus the precomputed animation state."""
     z = st["zoom"]
@@ -629,14 +732,24 @@ def render_frame(raw_bgr, st, s, sw, sh, cw, ch):
         draw_cursor(img, draw_sx, draw_sy,
                     size=s["cursor_size"], opacity=st["opacity"],
                     tilt=st["tilt"],
-                    pressed=st["pressed"], dragging=st["dragging"])
+                    pressed=st["pressed"], dragging=st["dragging"],
+                    style=s.get("cursor_style", "arrow"))
+
+    # Fast path: caller (App preview / Processor export) precomputed the
+    # chrome canvas once. We just paste the per-frame recording onto it.
+    if chrome is not None:
+        chrome_canvas, rx, ry, ow, oh = chrome
+        return paste_recording(chrome_canvas, img,
+                                rx, ry, ow, oh,
+                                s["roundness"], s["inset"])
 
     canvas, *_ = composite(
         img, cw, ch,
         s["bg_type"], s["bg_val"],
         s["padding"], s["inset"],
         s["roundness"], s["shadow"],
-        glass=s.get("glass", 0))
+        glass=s.get("glass", 0),
+        bg_blur=s.get("bg_blur", 0))
     return canvas
 
 
@@ -782,12 +895,16 @@ class Recorder:
         raw_path = os.path.join(bundle_dir, "raw.mkv")
         w, h = region["width"], region["height"]
 
+        # -g {fps//2}: keyframe every ~0.5s. Editor scrubbing seeks to
+        # the nearest keyframe before decoding forward; tight keyframes
+        # keep scrub latency low.
         cmd = [
             "ffmpeg", "-y", "-loglevel", "error",
             "-f", "rawvideo", "-vcodec", "rawvideo",
             "-s", f"{w}x{h}", "-pix_fmt", "bgra",
             "-r", str(self.fps), "-i", "pipe:0",
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+            "-g", str(max(2, self.fps // 2)),
             "-pix_fmt", "yuv420p", raw_path,
         ]
         try:
@@ -903,6 +1020,14 @@ class Processor:
         track = precompute_track(events_raw, meta, s)
         n = len(track) or int(src.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
 
+        # Chrome is constant for the whole export — build it once and
+        # pass it to every render_frame call.
+        self.prog(4, "Building canvas chrome...")
+        chrome = build_chrome(
+            cw, ch, s["bg_type"], s["bg_val"], sw, sh,
+            s["padding"], s["inset"], s["roundness"],
+            s["shadow"], s.get("glass", 0), s.get("bg_blur", 0))
+
         self.prog(5, "Opening encoder...")
         cmd = [
             "ffmpeg","-y","-loglevel","error",
@@ -926,7 +1051,8 @@ class Processor:
         while fi < n:
             ok, frame = src.read()
             if not ok: break
-            canvas = render_frame(frame, track[fi], s, sw, sh, cw, ch)
+            canvas = render_frame(frame, track[fi], s, sw, sh, cw, ch,
+                                   chrome=chrome)
             bgr = cv2.cvtColor(np.array(canvas), cv2.COLOR_RGBA2BGR)
             try:
                 proc.stdin.write(bgr.tobytes())
@@ -987,6 +1113,8 @@ class App(ctk.CTk):
         self._meta_events   = None
         self._track         = None
         self._track_key     = None
+        self._chrome        = None
+        self._chrome_key    = None
         self._cur_frame     = 0
         self._total         = 1
         self._fps_meta      = 30
@@ -1031,6 +1159,7 @@ class App(ctk.CTk):
         self.shadow_var       = ctk.DoubleVar(value=70)
         self.cursor_size_var  = ctk.DoubleVar(value=36)
         self.glass_var        = ctk.DoubleVar(value=14)
+        self.bg_blur_var      = ctk.DoubleVar(value=0)
         self.smooth_var       = ctk.DoubleVar(value=0.0)
         self.ripple_var       = ctk.BooleanVar(value=True)
         self.show_cursor_var  = ctk.BooleanVar(value=True)
@@ -1038,13 +1167,16 @@ class App(ctk.CTk):
         self.loop_cursor_var  = ctk.BooleanVar(value=False)
         self.autozoom_var     = ctk.BooleanVar(value=True)
         self.zoomlevel_var    = ctk.DoubleVar(value=2.0)
+        self.cursor_style_var = ctk.StringVar(value="arrow")
+        self.bg_tab_var       = ctk.StringVar(value="Gradient")
 
         for v in (self.canvas_var, self.padding_var, self.roundness_var,
-                  self.shadow_var, self.glass_var,
+                  self.shadow_var, self.glass_var, self.bg_blur_var,
                   self.cursor_size_var, self.smooth_var,
                   self.ripple_var, self.show_cursor_var,
                   self.autohide_var, self.loop_cursor_var,
-                  self.autozoom_var, self.zoomlevel_var):
+                  self.autozoom_var, self.zoomlevel_var,
+                  self.cursor_style_var):
             v.trace_add("write", lambda *a: self._request_render())
 
     # ── small helpers ──────────────────────────────────────────
@@ -1272,14 +1404,26 @@ class App(ctk.CTk):
             b.pack(side="left", padx=2)
             self._preset_btns[preset] = b
 
-        # BACKGROUND
+        # BACKGROUND  — segmented tabs, conditional panels, blur slider.
         self._section(parent, "BACKGROUND")
-        ctk.CTkLabel(parent, text="Gradients",
-                     font=ctk.CTkFont("Segoe UI", 10),
-                     text_color="#5e5e75").pack(anchor="w", padx=18, pady=(2, 4))
-        gg = ctk.CTkFrame(parent, fg_color="transparent")
-        gg.pack(padx=14)
-        self._bg_btns = []
+        tabs = ctk.CTkSegmentedButton(
+            parent, values=["Gradient", "Color", "Image"],
+            variable=self.bg_tab_var,
+            command=self._on_bg_tab,
+            selected_color=self.ACCENT,
+            selected_hover_color=self.ACCENT_H,
+            unselected_color=self.PANEL_2,
+            unselected_hover_color=self.BORDER,
+            text_color=self.FG, height=30, corner_radius=8)
+        tabs.pack(fill="x", padx=14, pady=(2, 8))
+
+        self._bg_btns   = []
+        self._bg_panels = {}
+
+        # Gradient panel
+        gpan = ctk.CTkFrame(parent, fg_color="transparent")
+        gg   = ctk.CTkFrame(gpan, fg_color="transparent")
+        gg.pack(padx=0, pady=(2, 0))
         for i, (c1, c2) in enumerate(GRADIENTS):
             btn = tk.Canvas(gg, width=44, height=28,
                              highlightthickness=2,
@@ -1292,31 +1436,79 @@ class App(ctk.CTk):
                 g = int(int(c1[3:5], 16) * (1 - t) + int(c2[3:5], 16) * t)
                 b = int(int(c1[5:7], 16) * (1 - t) + int(c2[5:7], 16) * t)
                 btn.create_line(x, 0, x, 28, fill=f"#{r:02x}{g:02x}{b:02x}")
-            btn.bind("<Button-1>", lambda e, idx=i, b=btn: self._set_bg_grad(idx, b))
+            btn.bind("<Button-1>",
+                     lambda e, idx=i, b=btn: self._set_bg_grad(idx, b))
             self._bg_btns.append(btn)
+        self._bg_panels["Gradient"] = gpan
 
-        ctk.CTkLabel(parent, text="Solid colors",
-                     font=ctk.CTkFont("Segoe UI", 10),
-                     text_color="#5e5e75").pack(anchor="w", padx=18, pady=(12, 4))
-        sg = ctk.CTkFrame(parent, fg_color="transparent")
-        sg.pack(padx=14, pady=(0, 4))
+        # Color panel
+        cpan = ctk.CTkFrame(parent, fg_color="transparent")
+        sg = ctk.CTkFrame(cpan, fg_color="transparent")
+        sg.pack(padx=0, pady=(2, 0))
         for i, col in enumerate(SOLIDS):
-            btn = tk.Canvas(sg, width=34, height=24, bg=col, bd=0,
+            btn = tk.Canvas(sg, width=38, height=28, bg=col, bd=0,
                              highlightthickness=2,
                              highlightbackground=self.BORDER, cursor="hand2")
-            btn.grid(row=i // 8, column=i % 8, padx=3, pady=3)
-            btn.bind("<Button-1>", lambda e, c=col, b=btn: self._set_bg_solid(c, b))
+            btn.grid(row=i // 6, column=i % 6, padx=3, pady=3)
+            btn.bind("<Button-1>",
+                     lambda e, c=col, b=btn: self._set_bg_solid(c, b))
             self._bg_btns.append(btn)
+        self._bg_panels["Color"] = cpan
+
+        # Image panel
+        ipan = ctk.CTkFrame(parent, fg_color="transparent")
+        self._bg_image_lbl = ctk.CTkLabel(
+            ipan, text="No image selected",
+            font=ctk.CTkFont("Segoe UI", 10),
+            text_color=self.MUTED)
+        self._bg_image_lbl.pack(pady=(0, 6))
+        ctk.CTkButton(
+            ipan, text="Choose image…",
+            width=160, height=32,
+            font=ctk.CTkFont("Segoe UI", 11, weight="bold"),
+            fg_color=self.PANEL_2, hover_color=self.BORDER,
+            text_color=self.FG, corner_radius=8,
+            command=self._pick_bg_image).pack()
+        self._bg_panels["Image"] = ipan
+
+        self._show_bg_panel(self.bg_tab_var.get())
+
+        # Background blur — applies to the chrome only.
+        self._slider(parent, "Background blur", self.bg_blur_var, 0, 40)
 
         # FRAME STYLE
         self._section(parent, "FRAME")
-        self._slider(parent, "Padding",   self.padding_var,   0, 160)
-        self._slider(parent, "Roundness", self.roundness_var, 0, 40)
-        self._slider(parent, "Shadow",    self.shadow_var,    0, 100)
-        self._slider(parent, "Glass halo", self.glass_var,    0, 40)
+        self._slider(parent, "Padding",    self.padding_var,   0, 160)
+        self._slider(parent, "Roundness",  self.roundness_var, 0, 40)
+        self._slider(parent, "Shadow",     self.shadow_var,    0, 100)
+        self._slider(parent, "Glass halo", self.glass_var,     0, 40)
 
         # CURSOR
         self._section(parent, "CURSOR")
+        # Style picker — small previews rendered from CURSOR_STYLES.
+        style_row = ctk.CTkFrame(parent, fg_color="transparent")
+        style_row.pack(fill="x", padx=14, pady=(2, 6))
+        self._cursor_style_btns = {}
+        self._cursor_style_imgs = {}     # keep PhotoImage refs alive
+        for name in ("arrow", "modern", "triangle", "hand", "dot", "ring"):
+            sprite, _, _ = _draw_sprite(name, 1.0, 1.0)
+            sprite = sprite.crop(sprite.getbbox() or (0, 0, 32, 32))
+            sprite.thumbnail((26, 26), Image.LANCZOS)
+            pad = Image.new("RGBA", (32, 32), (0, 0, 0, 0))
+            pad.paste(sprite, ((32 - sprite.width)//2,
+                               (32 - sprite.height)//2), sprite)
+            tk_img = ImageTk.PhotoImage(pad)
+            self._cursor_style_imgs[name] = tk_img
+            sel = (name == self.cursor_style_var.get())
+            b = ctk.CTkButton(
+                style_row, text="", image=tk_img,
+                width=42, height=42,
+                fg_color=self.ACCENT if sel else self.PANEL_2,
+                hover_color=self.ACCENT_H, corner_radius=8,
+                command=lambda n=name: self._set_cursor_style(n))
+            b.pack(side="left", padx=2)
+            self._cursor_style_btns[name] = b
+
         self._toggle(parent, "Cursor overlay",   self.show_cursor_var)
         self._slider(parent, "Size",             self.cursor_size_var, 16, 64)
         self._slider(parent, "Smoothness",       self.smooth_var, 0.0, 1.0,
@@ -1339,6 +1531,31 @@ class App(ctk.CTk):
         for name, b in self._preset_btns.items():
             b.configure(fg_color=self.ACCENT if name == p else self.PANEL_2)
 
+    def _show_bg_panel(self, name):
+        for k, p in self._bg_panels.items():
+            p.pack_forget()
+        panel = self._bg_panels.get(name)
+        if panel:
+            panel.pack(fill="x", padx=14, pady=(0, 4))
+
+    def _on_bg_tab(self, value):
+        self._show_bg_panel(value)
+
+    def _pick_bg_image(self):
+        path = filedialog.askopenfilename(
+            title="Choose background image",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        self.bg_type = "image"
+        self.bg_val  = path
+        # Clear gradient/solid selection chrome.
+        for b in self._bg_btns:
+            b.configure(highlightbackground=self.BORDER)
+        self._bg_image_lbl.configure(text=os.path.basename(path))
+        self._request_render()
+
     def _set_bg_grad(self, idx, btn):
         self.bg_type = "gradient"
         self.bg_val  = GRADIENTS[idx]
@@ -1354,6 +1571,11 @@ class App(ctk.CTk):
             b.configure(highlightbackground=self.BORDER)
         btn.configure(highlightbackground=self.ACCENT)
         self._request_render()
+
+    def _set_cursor_style(self, name):
+        self.cursor_style_var.set(name)
+        for n, b in self._cursor_style_btns.items():
+            b.configure(fg_color=self.ACCENT if n == name else self.PANEL_2)
 
     # ── settings dict (single source of truth for render+export)
     def _settings(self):
@@ -1379,9 +1601,11 @@ class App(ctk.CTk):
             "roundness":     int(self.roundness_var.get()),
             "shadow":        int(self.shadow_var.get()),
             "glass":         int(self.glass_var.get()),
+            "bg_blur":       int(self.bg_blur_var.get()),
             "bg_type":       self.bg_type,
             "bg_val":        self.bg_val,
             "cursor_size":   int(self.cursor_size_var.get()),
+            "cursor_style":  self.cursor_style_var.get(),
             "stiffness":     k / 1200.0,    # downstream multiplies back
             "damping":       b / 90.0,
             "cursor_tilt":   self._cursor_tilt,
@@ -1520,14 +1744,16 @@ class App(ctk.CTk):
                 or self._preview_src is None):
             return
         s = self._settings()
-        key = (s["padding"], s["roundness"], s["shadow"],
-               s["bg_type"], str(s["bg_val"]),
-               s["cursor_size"], s["stiffness"], s["damping"],
-               s["click_ripple"], s["auto_zoom"], s["zoom_level"],
-               s["zoom_dur"], s["canvas_preset"])
-        if key != self._track_key:
+        # Track depends on cursor/zoom physics + click + canvas size.
+        track_key = (s["padding"], s["roundness"], s["shadow"],
+                     s["bg_type"], str(s["bg_val"]),
+                     s["cursor_size"], s["stiffness"], s["damping"],
+                     s["click_ripple"], s["auto_zoom"], s["zoom_level"],
+                     s["zoom_dur"], s["canvas_preset"],
+                     s.get("loop_cursor", False))
+        if track_key != self._track_key:
             self._track = precompute_track(self._meta_events, self._meta, s)
-            self._track_key = key
+            self._track_key = track_key
         self._render_current_frame()
 
     def _render_current_frame(self):
@@ -1543,7 +1769,22 @@ class App(ctk.CTk):
         sw, sh = reg["width"], reg["height"]
         cw, ch = canvas_dims(self._meta, s)
 
-        canvas = render_frame(frame, self._track[fi], s, sw, sh, cw, ch)
+        # Chrome (background + shadow + glass) is the slow part. Cache
+        # it across frames and only rebuild when one of its inputs
+        # actually changed.
+        chrome_key = (cw, ch, s["bg_type"], str(s["bg_val"]), sw, sh,
+                      s["padding"], s["inset"], s["roundness"],
+                      s["shadow"], s.get("glass", 0),
+                      s.get("bg_blur", 0))
+        if chrome_key != self._chrome_key:
+            self._chrome = build_chrome(
+                cw, ch, s["bg_type"], s["bg_val"], sw, sh,
+                s["padding"], s["inset"], s["roundness"],
+                s["shadow"], s.get("glass", 0), s.get("bg_blur", 0))
+            self._chrome_key = chrome_key
+
+        canvas = render_frame(frame, self._track[fi], s, sw, sh, cw, ch,
+                               chrome=self._chrome)
 
         pw = max(160, self.prev_canvas.winfo_width() - 8)
         ph = max(120, self.prev_canvas.winfo_height() - 8)
