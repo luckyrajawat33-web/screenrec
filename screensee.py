@@ -47,6 +47,27 @@ except ImportError:
 CURSORS_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "cursors")
 
+# Persistent location for finished recording bundles. Putting them in
+# ~/Documents/ScreenSee Recordings/ instead of TEMP keeps them out of
+# the system's automatic-cleanup path and makes them trivially
+# locatable from the OS file browser.
+RECORDINGS_DIR = os.path.join(
+    os.path.expanduser("~"), "Documents", "ScreenSee Recordings")
+
+
+def reveal_in_explorer(path):
+    """Open `path` in the OS file browser. No-op on failure — purely a
+    convenience affordance."""
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(path)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except Exception:
+        pass
+
 # ── Win32 cursor sampling ─────────────────────────────────────
 # Maps the OS cursor handle returned by GetCursorInfo() to one of our
 # CURSOR_STYLES names. Lets the renderer swap sprites to match what the
@@ -1464,6 +1485,21 @@ class App(ctk.CTk):
             font=ctk.CTkFont("Cascadia Code", 26, weight="bold"),
             text_color=self.ACCENT)
         self.welcome_status.pack(pady=(28, 0))
+
+        ctk.CTkLabel(
+            center,
+            text=f"Recordings saved to: {RECORDINGS_DIR}",
+            font=ctk.CTkFont("Segoe UI", 11),
+            text_color=self.MUTED,
+        ).pack(pady=(24, 4))
+        ctk.CTkButton(
+            center, text="Open Recordings Folder",
+            width=200, height=32,
+            font=ctk.CTkFont("Segoe UI", 11),
+            fg_color=self.PANEL_2, hover_color=self.BORDER,
+            text_color=self.FG, corner_radius=8,
+            command=self._reveal_bundle,
+        ).pack(pady=(2, 0))
         return wrap
 
     # ── EDITOR screen ──────────────────────────────────────────
@@ -1488,6 +1524,12 @@ class App(ctk.CTk):
                       fg_color=self.PANEL_2, hover_color=self.BORDER,
                       text_color=self.FG, corner_radius=8,
                       command=self._new_recording).pack(side="left", padx=4)
+        ctk.CTkButton(right, text="Show Folder",
+                      width=110, height=34,
+                      font=ctk.CTkFont("Segoe UI", 12),
+                      fg_color=self.PANEL_2, hover_color=self.BORDER,
+                      text_color=self.FG, corner_radius=8,
+                      command=self._reveal_bundle).pack(side="left", padx=4)
         ctk.CTkButton(right, text="Export MP4",
                       width=130, height=34,
                       font=ctk.CTkFont("Segoe UI", 12, weight="bold"),
@@ -1772,8 +1814,9 @@ class App(ctk.CTk):
     # ── Recording ──────────────────────────────────────────────
     def toggle_recording(self):
         if not self.recording:
+            os.makedirs(RECORDINGS_DIR, exist_ok=True)
             self.bundle_path = os.path.join(
-                tempfile.gettempdir(),
+                RECORDINGS_DIR,
                 f"screensee_{int(time.time())}.screensee")
             self.recording = True
             self._rec_start = time.perf_counter()
@@ -1835,6 +1878,16 @@ class App(ctk.CTk):
             self.welcome_status.configure(
                 text=f"{int(e//60):02d}:{int(e%60):02d}.{int((e%1)*1000):03d}")
             self.after(33, self._tick)
+
+    def _reveal_bundle(self):
+        """Open the current recording's folder (or the recordings root
+        if nothing is loaded) in the OS file browser."""
+        target = self.bundle_path if (
+            self.bundle_path and os.path.isdir(self.bundle_path)
+        ) else RECORDINGS_DIR
+        if not os.path.isdir(target):
+            os.makedirs(target, exist_ok=True)
+        reveal_in_explorer(target)
 
     def _new_recording(self):
         self._playing = False

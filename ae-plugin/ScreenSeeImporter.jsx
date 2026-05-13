@@ -328,7 +328,10 @@
             // "...Math.round(s) === 4 ? 100 : 0...". Parse it back so the
             // mapping survives reorderings of the file.
             var ox = L.ks && L.ks.o && L.ks.o.x ? L.ks.o.x : "";
-            var m = ox.match(/===\s*(\d+)/);
+            // Pull the index out of the embedded Bodymovin opacity expr
+            // (e.g. "Math.round(s) === 4 ? 100 : 0"). RegExp() avoids the
+            // ExtendScript parser confusing "/===" with the /= operator.
+            var m = ox.match(new RegExp("===\\s*(\\d+)"));
             var idx = m ? parseInt(m[1], 10) : null;
             if (idx !== null && idx >= 0 && idx <= 4) {
                 byIndex[idx] = L;
