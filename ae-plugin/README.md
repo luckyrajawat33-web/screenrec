@@ -58,8 +58,8 @@ Top to bottom in the timeline:
 | `Pointinghand Cursor`  | Style Index === 2                                             |
 | `Openhand Cursor`      | Style Index === 3                                             |
 | `Closedhand Cursor`    | Style Index === 4                                             |
-| `Cursor Position Null` | Parent of the 5 cursors. Position = Screen Pos (+ smoothing); Scale = Cursor Size / 500 × 100. |
-| `Style Driver`         | Slider Control "Style Index" — hold-keyed from CURSOR_<style> events. |
+| `Cursor Position Null` | Parent of the 5 cursors. Position = Screen Pos (+ Smoothness); Scale = Cursor Size / 500 × 100. Cursors parent into this so their anchor (hotspot) lands exactly at the null's position. |
+| `Style Driver`         | Holds **Style Index** (hold-keyed from CURSOR_<style> events), **Cursor Size**, and **Cursor Smoothness**. Lives here, not in the main Controls, so the cursor knobs are alongside the cursors they drive. |
 | `Screen Pos`           | Point Control "Screen Pos" — linear-keyed from MOVE events.   |
 | `Screen Recording Footage` | The raw.mkv footage.                                      |
 
@@ -73,44 +73,35 @@ so the visible cursor tip lands exactly at the Screen Pos coordinate.
 Click the **Controls** null in `ScreenSee Edit` and open **Effect
 Controls**. Every parameter is keyframable.
 
-| Effect              | Default            | What it does                                            |
-|---------------------|--------------------|---------------------------------------------------------|
-| Padding             | 60                 | Empty space between recording and canvas edge.          |
-| Roundness           | 14                 | Recording corner radius (also affects the matte).       |
-| Shadow              | 70                 | Drop-shadow opacity / distance / softness.              |
-| Glass Halo          | 14                 | Width + softness of the white plate behind the recording.|
-| Auto Zoom           | off                | Master toggle for zooming the recording into the matte. |
-| Zoom Level          | 2.0                | Multiplier when Auto Zoom is on.                        |
-| Zoom Position       | (0.5, 0.5)         | Normalised point in source to centre when zoomed. `[0.5, 0.5]` = no pan; `[0, 0]` = top-left of source; `[1, 1]` = bottom-right. |
-| BG Color A / B      | indigo / violet    | Top + bottom of the background gradient.                |
-| Cursor Size         | 200                | Cursor sprite size. Expression scales by `sz / 500 × 100`. |
-| Cursor Smoothness   | 0                  | 0 = exact cursor follow. >0 blends in `.smooth()`.      |
+| Effect              | Default            | Lives on                | What it does                                            |
+|---------------------|--------------------|-------------------------|---------------------------------------------------------|
+| Padding             | 60                 | Main comp / Controls    | Empty space between recording and canvas edge. Recording is fit (not cover-cropped) inside the matte. |
+| Roundness           | 14                 | Main comp / Controls    | Recording corner radius (also affects the matte and halo). |
+| Shadow              | 70                 | Main comp / Controls    | Drop-shadow opacity / distance / softness.              |
+| Glass Halo          | 14                 | Main comp / Controls    | Width of the soft white plate behind the recording (no blur — keeps the edge crisp). |
+| Zoom Level          | 1.0                | Main comp / Controls    | Plain scale multiplier on the Recording precomp. 1.0 = no zoom, fits inside matte. >1 zooms into the recording with the matte still clipping the overflow. |
+| Zoom Position       | (0.5, 0.5)         | Main comp / Controls    | Normalised pan target. Pan range = `max(0, zoomedSize − matteSize)`, so at Zoom Level 1 the slider has no effect; at >1 a value of (0, 0) pulls the source's top-left into view and (1, 1) its bottom-right. |
+| BG Color A / B      | indigo / violet    | Main comp / Controls    | Top + bottom of the background gradient.                |
+| Style Index         | 0                  | Recording / Style Driver | Which cursor sprite is visible. Hold-keyed from CURSOR_<style> events; scrub to override. |
+| Cursor Size         | 200                | Recording / Style Driver | Cursor sprite size. Scale expression: `sz / 500 × 100`. |
+| Cursor Smoothness   | 0                  | Recording / Style Driver | 0 = exact follow. >0 blends in `.smooth(0.1 + s × 0.5, 5)`. |
 
 ## How zoom works (and why the matte stays put)
 
-- `Recording Matte` size is built from `[thisComp.width - pad*2, thisComp.height - pad*2]`.
-  It has **no zoom in the expression** — only Padding and Roundness.
-- `Recording` Scale is `cover-fit × Zoom Level` when Auto Zoom is on.
-- `Recording` Position offsets by `(Zoom Position - 0.5) × source × scale`
-  so the chosen source point lands at the matte centre. Only applied
-  when Auto Zoom is on **and** Zoom Level > 1.
+- `Recording Matte` size = `[comp.width - pad*2, comp.height - pad*2]`. Padding and Roundness only — never zoom.
+- `Recording` Scale = `Math.min(frameW/srcW, frameH/srcH) * 100 * Zoom Level`. `Math.min` so the source **fits** inside the matte instead of cover-cropping it at Zoom Level 1.
+- `Recording` Position offsets by `(Zoom Position - 0.5) * max(0, scaledSrc - frame)`. The pan amount is the actual overflow past the matte, so at Zoom Level 1 the slider does nothing and at >1 a 0.5-step move shifts the source by half the overflow — never beyond what the matte can see.
 
-Result: the visible window stays the same size (the matte never moves),
-the footage zooms inside it, and you pan by dragging the Zoom Position
-point.
+The matte stays a fixed rounded rectangle; the recording slides inside it.
 
 ## Auto-pan to cursor (optional)
 
-To make the zoomed footage follow the cursor automatically, replace
-the Zoom Position expression with:
+To follow the cursor automatically while zoomed, set Zoom Position via expression instead of a value. On **Recording → Transform → Position**, replace the `var zp = ...` line with:
 
 ```
 var sp = thisLayer.source.layer("Screen Pos").effect("Screen Pos")("Point");
-[sp[0] / thisLayer.source.width, sp[1] / thisLayer.source.height];
+var zp = [sp[0] / thisLayer.source.width, sp[1] / thisLayer.source.height];
 ```
-
-Drop that on the **Recording → Transform → Position** expression in
-place of the `var zp = ...` line.
 
 ## Exporting
 

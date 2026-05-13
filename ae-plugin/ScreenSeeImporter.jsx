@@ -170,15 +170,12 @@
         return null;
     }
 
-    function buildCursorLayer(comp, lottieLayer, opacityExpr) {
+    function buildCursorLayer(comp, lottieLayer, opacityExpr, parentLayer) {
         var shapeLyr = comp.layers.addShape();
         shapeLyr.name = lottieLayer.nm;
         var ks = lottieLayer.ks;
         if (ks.a && ks.a.k)
             shapeLyr.transform.anchorPoint.setValue([ks.a.k[0], ks.a.k[1]]);
-        // Cursor sits at parent (Cursor Position Null) origin so the
-        // anchor (hotspot) lands exactly where the null is positioned.
-        shapeLyr.transform.position.setValue([0, 0]);
         if (ks.s && ks.s.k)
             shapeLyr.transform.scale.setValue([ks.s.k[0], ks.s.k[1]]);
         if (ks.r && typeof ks.r.k === "number")
@@ -189,6 +186,17 @@
         for (var si = 0; si < lottieLayer.shapes.length; si++) {
             addShapeItem(contents, lottieLayer.shapes[si]);
         }
+
+        // Parent first, *then* zero out position so [0, 0] is in PARENT
+        // space (i.e. the cursor's anchor lands exactly at the null's
+        // position). Setting position before parenting makes AE
+        // recompute it to preserve world coords, leaving each cursor
+        // stranded at (0, 0) of the precomp — which is why every cursor
+        // had to be re-aligned by hand on the previous import.
+        if (parentLayer) {
+            shapeLyr.parent = parentLayer;
+        }
+        shapeLyr.transform.position.setValue([0, 0]);
         return shapeLyr;
     }
 
@@ -259,7 +267,10 @@
         }
         screenPosProp.setValuesAtTimes(pTimes, pVals);
 
-        // ── Style Driver null with Slider Control, keyed from CURSOR_<style>
+        // ── Style Driver null. Holds Style Index (hold-keyed from
+        //    CURSOR_<style> events) plus Cursor Size and Cursor
+        //    Smoothness — these belong with the cursor sprites, not in
+        //    the main comp's Controls null.
         var styleLayer = recComp.layers.addNull(duration);
         styleLayer.name = "Style Driver";
         styleLayer.guideLayer = true;
@@ -267,6 +278,12 @@
         var styleEff = styleLayer.Effects.addProperty("ADBE Slider Control");
         styleEff.name = "Style Index";
         var styleProp = styleEff.property(1);
+        var sizeEff = styleLayer.Effects.addProperty("ADBE Slider Control");
+        sizeEff.name = "Cursor Size";
+        sizeEff.property(1).setValue(200);
+        var smoEff = styleLayer.Effects.addProperty("ADBE Slider Control");
+        smoEff.name = "Cursor Smoothness";
+        smoEff.property(1).setValue(0);
 
         var styleTimes = [];
         var styleVals  = [];
@@ -293,11 +310,13 @@
         }
 
         // ── Cursor Position Null (parent for the cursor shapes) ──
+        //    Position, Size, and Smoothness all read from Style Driver
+        //    in this same precomp — no cross-comp reference needed.
         var cursorNull = recComp.layers.addNull(duration);
         cursorNull.name = "Cursor Position Null";
         cursorNull.transform.anchorPoint.setValue([0, 0]);
         cursorNull.transform.position.expression =
-            'var smo = ' + masterCtrl("Cursor Smoothness", "Slider") + ';\n' +
+            'var smo = thisComp.layer("Style Driver").effect("Cursor Smoothness")("Slider");\n' +
             'var sp  = thisComp.layer("Screen Pos");\n' +
             'var raw = sp.effect("Screen Pos")("Point");\n' +
             'var p   = raw;\n' +
@@ -308,7 +327,7 @@
             '}\n' +
             'p;';
         cursorNull.transform.scale.expression =
-            'var sz = ' + masterCtrl("Cursor Size", "Slider") + ';\n' +
+            'var sz = thisComp.layer("Style Driver").effect("Cursor Size")("Slider");\n' +
             'var s  = sz / 500 * 100;\n' +
             '[s, s];';
 
@@ -344,15 +363,8 @@
             var opacityExpr =
                 'var s = thisComp.layer("Style Driver").effect("Style Index")("Slider");\n' +
                 'Math.round(s) === ' + idx + ' ? 100 : 0;';
-            var aeLyr = buildCursorLayer(recComp, lLayer, opacityExpr);
+            var aeLyr = buildCursorLayer(recComp, lLayer, opacityExpr, cursorNull);
             cursorLayers.push(aeLyr);
-        }
-
-        // Parent the cursor shapes to Cursor Position Null. AE matches by
-        // layer index; refresh after layer additions.
-        var cursorNullIdx = cursorNull.index;
-        for (var ci = 0; ci < cursorLayers.length; ci++) {
-            cursorLayers[ci].parent = cursorNull;
         }
 
         // ════════════════════════════════════════════════════════
@@ -397,13 +409,10 @@
         addSlider("Roundness",       14);
         addSlider("Shadow",          70);
         addSlider("Glass Halo",      14);
-        addCheck ("Auto Zoom",        false);
-        addSlider("Zoom Level",      2.0);
+        addSlider("Zoom Level",      1.0);
         addPoint ("Zoom Position",   [0.5, 0.5]);
         addColor ("BG Color A", [0.10, 0.16, 0.36]);
         addColor ("BG Color B", [0.55, 0.32, 0.85]);
-        addSlider("Cursor Size",     200);
-        addSlider("Cursor Smoothness", 0);
 
         // ── Background (solid + Ramp + blur) ────────────────────
         var bg = masterComp.layers.addSolid(
@@ -439,38 +448,43 @@
         glass.transform.opacity.expression =
             'var halo = ' + thisCompCtrl("Glass Halo", "Slider") + ';\n' +
             'halo > 0 ? 100 : 0;';
-        var glassBlur = glass.Effects.addProperty("ADBE Gaussian Blur 2");
-        glassBlur.property(1).expression =
-            'var halo = ' + thisCompCtrl("Glass Halo", "Slider") + ';\n' +
-            'halo / 2;';
+        // No Gaussian blur — the blur was bleeding into the rounded
+        // corners and softening the edge of the recording itself. The
+        // halo is now a crisp rounded rectangle with low fill opacity.
 
         // ── Recording (precomp instance) ─────────────────────────
         var rec = masterComp.layers.add(recComp);
         rec.name = "Recording";
+        // Scale: fit inside the matte using Math.min so the source is
+        // letterboxed instead of cover-cropped. Zoom Level is a plain
+        // multiplier — at 1.0 the recording fits exactly, above 1.0 it
+        // zooms in and the matte clips the overflow.
         rec.transform.scale.expression =
-            'var pad    = ' + thisCompCtrl("Padding", "Slider") + ';\n' +
-            'var z      = ' + thisCompCtrl("Zoom Level", "Slider") + ';\n' +
-            'var zoomOn = ' + thisCompCtrl("Auto Zoom", "Checkbox") + ';\n' +
+            'var pad = ' + thisCompCtrl("Padding", "Slider") + ';\n' +
+            'var z   = ' + thisCompCtrl("Zoom Level", "Slider") + ';\n' +
             'var srcW   = thisLayer.source.width;\n' +
             'var srcH   = thisLayer.source.height;\n' +
             'var frameW = thisComp.width  - pad*2;\n' +
             'var frameH = thisComp.height - pad*2;\n' +
-            'var fit    = Math.max(frameW / srcW, frameH / srcH) * 100;\n' +
-            'zoomOn > 0.5 ? [fit * z, fit * z] : [fit, fit];';
+            'var fit    = Math.min(frameW / srcW, frameH / srcH) * 100;\n' +
+            '[fit * z, fit * z];';
+        // Position: pan range is the overflow of the zoomed recording
+        // past the matte edge — max(0, scaledSize - frame). At Zoom
+        // Level 1 the overflow is 0 so the slider has no effect; at >1
+        // a Zoom Position of [0, 0] pulls the source's top-left into
+        // view and [1, 1] its bottom-right. [0.5, 0.5] = centred.
         rec.transform.position.expression =
-            'var z      = ' + thisCompCtrl("Zoom Level", "Slider") + ';\n' +
-            'var zoomOn = ' + thisCompCtrl("Auto Zoom", "Checkbox") + ';\n' +
-            'var zp     = ' + thisCompCtrl("Zoom Position", "Point") + ';\n' +
-            'var s      = thisLayer.transform.scale[0] / 100;\n' +
+            'var pad = ' + thisCompCtrl("Padding", "Slider") + ';\n' +
+            'var zp  = ' + thisCompCtrl("Zoom Position", "Point") + ';\n' +
+            'var s   = thisLayer.transform.scale[0] / 100;\n' +
             'var srcW   = thisLayer.source.width;\n' +
             'var srcH   = thisLayer.source.height;\n' +
-            'var cx = thisComp.width  / 2;\n' +
-            'var cy = thisComp.height / 2;\n' +
-            'if (zoomOn > 0.5 && z > 1) {\n' +
-            '    cx -= (zp[0] - 0.5) * srcW * s;\n' +
-            '    cy -= (zp[1] - 0.5) * srcH * s;\n' +
-            '}\n' +
-            '[cx, cy];';
+            'var frameW = thisComp.width  - pad*2;\n' +
+            'var frameH = thisComp.height - pad*2;\n' +
+            'var panW = Math.max(0, srcW * s - frameW);\n' +
+            'var panH = Math.max(0, srcH * s - frameH);\n' +
+            '[thisComp.width/2  - (zp[0] - 0.5) * panW,\n' +
+            ' thisComp.height/2 - (zp[1] - 0.5) * panH];';
         var ds = rec.Effects.addProperty("ADBE Drop Shadow");
         ds.property("Opacity").expression =
             'Math.min(255, ' + thisCompCtrl("Shadow", "Slider") + ' * 2.5);';
@@ -507,8 +521,10 @@
               "  duration: " + duration.toFixed(2) + " s\n" +
               "  cursor samples: " + styleTimes.length + "\n" +
               "  move events: " + pTimes.length + "\n\n" +
-              "Tweak the 'Controls' null in the main comp to adjust the look.\n" +
-              "Set Zoom Position to a normalised point (0..1, [0.5, 0.5] = no pan).");
+              "Main comp 'Controls': Padding, Roundness, Shadow, Glass Halo,\n" +
+              "Zoom Level (1.0 = no zoom), Zoom Position ([0.5, 0.5] = centred),\n" +
+              "BG Color A / B.\n" +
+              "Recording precomp 'Style Driver': Style Index, Cursor Size, Cursor Smoothness.");
     } catch (err) {
         alert("Import failed: " + err.toString() +
               (err.stack ? ("\n\n" + err.stack) : ""));
