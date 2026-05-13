@@ -1,25 +1,34 @@
 /*
  * ScreenSee Importer for After Effects
  *
- * Imports a .screensee bundle (raw.mkv + events.json + meta.json) produced
- * by screensee.py and builds a fully editable composition:
+ * Imports a .screensee bundle (raw.mkv + events.json + meta.json) from
+ * screensee.py and builds an editable composition with cursor shapes
+ * baked from Cursor_Sprite.json (Bodymovin/Lottie export of the 5 cursor
+ * sprites — no SVG dependency anymore).
  *
- *   - Master comp "ScreenSee Edit" sized 1920x1080 by default
- *   - "Controls" null layer with sliders for every adjustable setting
- *     (padding, roundness, shadow, glass, bg colors + blur, cursor size,
- *     auto-hide, click ripples toggle, zoom, ...)
- *   - "Recording" footage layer with expression-driven scale, rounded-
- *     corner alpha matte, and drop shadow.
- *   - "Cursor" precomp containing the 5 SVG sprites; opacity is driven by
- *     a "Style Index" slider that holds CURSOR_<style> sample times so the
- *     overlay swaps between arrow / text / pointer / openhand / closedhand
- *     to match the live OS cursor at capture time.
- *   - Position keyframes from MOVE events, mapped from screen coords to
- *     canvas coords through the Recording layer's live scale + position.
- *   - One ripple shape layer per left-click, fading out over 0.45 s.
+ * Target structure
+ * ─────────────────
+ * MAIN COMP "ScreenSee Edit"  (1920x1080 by default)
+ *   ├── Recording Matte       (shape, rounded rect — fixed size, depends only on Padding/Roundness)
+ *   ├── Recording             (precomp instance, alpha matte = Recording Matte;
+ *   │                          Scale + Position driven by Auto Zoom / Zoom Level / Zoom Position)
+ *   ├── Glass Halo            (soft white plate under Recording)
+ *   ├── Background            (solid + Ramp gradient + Gaussian Blur)
+ *   └── Controls              (null, guide, disabled — holds every knob)
  *
- * Run from File > Scripts > Run Script File... and pick the .screensee
- * folder when prompted.
+ * RECORDING PRECOMP "Recording"  (source-resolution canvas, e.g. 2560x1440)
+ *   ├── Arrow Cursor          (shape, opacity expr: Style Index === 0)
+ *   ├── textcursor            (shape, opacity expr: Style Index === 1)
+ *   ├── Pointinghand Cursor   (shape, opacity expr: Style Index === 2)
+ *   ├── Openhand Cursor       (shape, opacity expr: Style Index === 3)
+ *   ├── Closedhand Cursor     (shape, opacity expr: Style Index === 4)
+ *   ├── Cursor Position Null  (parent for the 5 cursors; Position from Screen Pos + smoothing)
+ *   ├── Style Driver          (null with Slider Control "Style Index" — hold-keyed from CURSOR_<style> events)
+ *   ├── Screen Pos            (null with Point Control "Screen Pos" — linear-keyed from MOVE events)
+ *   └── Screen Recording Footage  (raw.mkv)
+ *
+ * All Controls live in the MAIN comp. Expressions inside the Recording
+ * precomp reach across via `comp(MASTER_COMP_NAME).layer("Controls")`.
  */
 
 (function () {
@@ -28,13 +37,17 @@
         return;
     }
 
+    // ── Master comp name; baked into cross-comp expressions ──────
+    var MASTER_COMP_NAME    = "ScreenSee Edit";
+    var RECORDING_COMP_NAME = "Recording";
+
     var SCRIPT_FILE = new File($.fileName);
     var SCRIPT_DIR  = SCRIPT_FILE.parent;
-    var CURSORS_DIR = new Folder(SCRIPT_DIR.fsName + "/cursors");
+    var CURSOR_JSON = new File(SCRIPT_DIR.fsName + "/Cursor_Sprite.json");
 
-    if (!CURSORS_DIR.exists) {
-        alert("Could not find cursors/ next to the script. Expected:\n" +
-              CURSORS_DIR.fsName);
+    if (!CURSOR_JSON.exists) {
+        alert("Missing Cursor_Sprite.json next to the script:\n" +
+              CURSOR_JSON.fsName);
         return;
     }
 
@@ -60,45 +73,134 @@
         return t;
     }
 
-    var meta, events;
+    var meta, events, cursorJson;
     try {
-        meta   = JSON.parse(readText(metaPath));
-        events = JSON.parse(readText(eventsPath));
+        meta       = JSON.parse(readText(metaPath));
+        events     = JSON.parse(readText(eventsPath));
+        cursorJson = JSON.parse(readText(CURSOR_JSON));
     } catch (e) {
-        alert("Failed to parse bundle JSON: " + e.toString());
+        alert("Failed to parse JSON: " + e.toString());
         return;
     }
 
     var sw  = meta.region.width;
     var sh  = meta.region.height;
     var lft = meta.region.left || 0;
-    var top = meta.region.top  || 0;
+    var topY = meta.region.top || 0;
     var fps = meta.fps;
     var frameCount = meta.frame_count || 0;
     var bundleDur  = (frameCount > 0 ? frameCount / fps : 30);
 
-    // Cursor sprite mapping. Order matters — index is what the Style
-    // Index slider holds.
-    var CURSOR_FILES = [
-        "cursor.svg",        // 0 arrow
-        "textcursor.svg",    // 1 text
-        "pointinghand.svg",  // 2 pointer
-        "openhand.svg",      // 3 openhand
-        "closedhand.svg"     // 4 closedhand
-    ];
+    // ── Style mapping. Indices below match Cursor_Sprite.json's
+    //    embedded opacity expressions and the layer order described in
+    //    the file header.
     var STYLE_TO_INDEX = {
-        "arrow": 0, "text": 1, "pointer": 2,
-        "openhand": 3, "closedhand": 4
+        "arrow":      0,
+        "text":       1,
+        "pointer":    2,
+        "openhand":   3,
+        "closedhand": 4
     };
-    // SVG hotspot (normalised 0..1) — sprite anchor point so the visible
-    // tip lands on the recorded screen coordinate.
-    var CURSOR_TIPS = [
-        [0.30, 0.18], // arrow
-        [0.50, 0.50], // text
-        [0.45, 0.06], // pointer
-        [0.50, 0.30], // openhand
-        [0.50, 0.40]  // closedhand
-    ];
+
+    // ── Lottie → AE shape-layer builder ─────────────────────────
+    // Walks Cursor_Sprite.json shape items and reconstructs them as native
+    // AE shape paths so the file is self-contained (no Bodymovin runtime).
+    function makeShape(lottieSh) {
+        var k = lottieSh.ks.k;
+        var sh = new Shape();
+        sh.vertices    = k.v;
+        sh.inTangents  = k.i;
+        sh.outTangents = k.o;
+        sh.closed      = !!k.c;
+        return sh;
+    }
+
+    function addShapeItem(parentContents, item) {
+        var t = item.ty;
+        if (t === "gr") {
+            var grp = parentContents.addProperty("ADBE Vector Group");
+            grp.name = item.nm || "Group";
+            var inner = grp.property("ADBE Vectors Group");
+            for (var i = 0; i < item.it.length; i++) {
+                var sub = item.it[i];
+                if (sub.ty === "tr") {
+                    // The "tr" sibling configures the group's own transform.
+                    var grpTr = grp.property("ADBE Vector Transform Group");
+                    if (sub.p && grpTr.property("Position"))
+                        grpTr.property("Position").setValue([sub.p.k[0], sub.p.k[1]]);
+                    if (sub.a && grpTr.property("Anchor Point"))
+                        grpTr.property("Anchor Point").setValue([sub.a.k[0], sub.a.k[1]]);
+                    if (sub.s && grpTr.property("Scale"))
+                        grpTr.property("Scale").setValue([sub.s.k[0], sub.s.k[1]]);
+                    if (sub.r && grpTr.property("Rotation") && typeof sub.r.k === "number")
+                        grpTr.property("Rotation").setValue(sub.r.k);
+                    if (sub.o && grpTr.property("Opacity") && typeof sub.o.k === "number")
+                        grpTr.property("Opacity").setValue(sub.o.k);
+                } else {
+                    addShapeItem(inner, sub);
+                }
+            }
+            return grp;
+        } else if (t === "sh") {
+            var pathProp = parentContents.addProperty("ADBE Vector Shape - Group");
+            pathProp.name = item.nm || "Path";
+            pathProp.property("Path").setValue(makeShape(item));
+            return pathProp;
+        } else if (t === "fl") {
+            var fill = parentContents.addProperty("ADBE Vector Graphic - Fill");
+            if (item.c && item.c.k) {
+                var fc = item.c.k;
+                fill.property("Color").setValue([fc[0], fc[1], fc[2]]);
+            }
+            if (item.o && typeof item.o.k === "number") {
+                fill.property("Opacity").setValue(item.o.k);
+            }
+            return fill;
+        } else if (t === "st") {
+            var stroke = parentContents.addProperty("ADBE Vector Graphic - Stroke");
+            if (item.c && item.c.k) {
+                var sc = item.c.k;
+                stroke.property("Color").setValue([sc[0], sc[1], sc[2]]);
+            }
+            if (item.w && typeof item.w.k === "number") {
+                stroke.property("Stroke Width").setValue(item.w.k);
+            }
+            return stroke;
+        }
+        return null;
+    }
+
+    function buildCursorLayer(comp, lottieLayer, opacityExpr) {
+        var shapeLyr = comp.layers.addShape();
+        shapeLyr.name = lottieLayer.nm;
+        var ks = lottieLayer.ks;
+        if (ks.a && ks.a.k)
+            shapeLyr.transform.anchorPoint.setValue([ks.a.k[0], ks.a.k[1]]);
+        // Cursor sits at parent (Cursor Position Null) origin so the
+        // anchor (hotspot) lands exactly where the null is positioned.
+        shapeLyr.transform.position.setValue([0, 0]);
+        if (ks.s && ks.s.k)
+            shapeLyr.transform.scale.setValue([ks.s.k[0], ks.s.k[1]]);
+        if (ks.r && typeof ks.r.k === "number")
+            shapeLyr.transform.rotation.setValue(ks.r.k);
+        shapeLyr.transform.opacity.expression = opacityExpr;
+
+        var contents = shapeLyr.property("ADBE Root Vectors Group");
+        for (var si = 0; si < lottieLayer.shapes.length; si++) {
+            addShapeItem(contents, lottieLayer.shapes[si]);
+        }
+        return shapeLyr;
+    }
+
+    // ── Expression strings (master-comp name baked in) ──────────
+    function masterCtrl(effectName, prop) {
+        return 'comp("' + MASTER_COMP_NAME + '").layer("Controls").effect("' +
+               effectName + '")("' + prop + '")';
+    }
+    function thisCompCtrl(effectName, prop) {
+        return 'thisComp.layer("Controls").effect("' + effectName + '")("' +
+               prop + '")';
+    }
 
     app.beginUndoGroup("Import ScreenSee bundle");
     try {
@@ -108,50 +210,64 @@
             proj = app.project;
         }
 
-        // ── Project folders ───────────────────────────────────────
+        // ── Project folders ─────────────────────────────────────
         var rootFolder    = proj.items.addFolder("ScreenSee – " + bundle.name);
         var sourcesFolder = proj.items.addFolder("Sources");
         sourcesFolder.parentFolder = rootFolder;
-        var cursorsFolder = proj.items.addFolder("Cursors");
-        cursorsFolder.parentFolder = rootFolder;
 
-        // ── Raw footage ───────────────────────────────────────────
+        // ── Raw footage ─────────────────────────────────────────
         var rawItem = proj.importFile(new ImportOptions(rawPath));
         rawItem.parentFolder = sourcesFolder;
         var duration = rawItem.duration;
         if (!duration || duration <= 0) duration = bundleDur;
 
-        // ── Cursor SVG imports ────────────────────────────────────
-        var cursorItems = [];
-        for (var i = 0; i < CURSOR_FILES.length; i++) {
-            var f = new File(CURSORS_DIR.fsName + "/" + CURSOR_FILES[i]);
-            if (!f.exists) {
-                alert("Missing cursor sprite: " + f.fsName);
-                throw new Error("missing cursor file");
+        // ════════════════════════════════════════════════════════
+        // RECORDING PRECOMP  (source-resolution canvas)
+        // ════════════════════════════════════════════════════════
+        var recComp = proj.items.addComp(
+            RECORDING_COMP_NAME, sw, sh, 1.0, duration, fps);
+        recComp.parentFolder = rootFolder;
+
+        // ── Footage layer (bottom) ──────────────────────────────
+        var footage = recComp.layers.add(rawItem);
+        footage.name = "Screen Recording Footage";
+        footage.transform.position.setValue([sw / 2, sh / 2]);
+
+        // ── Screen Pos null with Point Control, keyed from MOVE events
+        var screenPosLayer = recComp.layers.addNull(duration);
+        screenPosLayer.name = "Screen Pos";
+        screenPosLayer.guideLayer = true;
+        screenPosLayer.enabled = false;
+        var screenPosEff = screenPosLayer.Effects.addProperty("ADBE Point Control");
+        screenPosEff.name = "Screen Pos";
+        var screenPosProp = screenPosEff.property(1);
+
+        var pTimes = [], pVals = [];
+        var lastX = sw / 2, lastY = sh / 2;
+        for (var mi = 0; mi < events.length; mi++) {
+            var em = events[mi];
+            if (em.type === "MOVE") {
+                lastX = em.x - lft;
+                lastY = em.y - topY;
+                pTimes.push(em.t);
+                pVals.push([lastX, lastY]);
             }
-            var ci = proj.importFile(new ImportOptions(f));
-            ci.parentFolder = cursorsFolder;
-            // AE imports SVGs as continuously-rasterized footage; flag the
-            // layer for it later.
-            cursorItems.push(ci);
         }
+        if (pTimes.length === 0) {
+            pTimes = [0];
+            pVals  = [[sw / 2, sh / 2]];
+        }
+        screenPosProp.setValuesAtTimes(pTimes, pVals);
 
-        // ── Cursor sprite precomp ─────────────────────────────────
-        // 128x128 canvas centred on the cursor hotspot. Each frame, the
-        // Style Index slider picks which of the 5 sprites is visible.
-        var SPRITE_BOX = 128;
-        var cursorComp = proj.items.addComp(
-            "Cursor Sprite", SPRITE_BOX, SPRITE_BOX, 1.0, duration, fps);
-        cursorComp.parentFolder = rootFolder;
+        // ── Style Driver null with Slider Control, keyed from CURSOR_<style>
+        var styleLayer = recComp.layers.addNull(duration);
+        styleLayer.name = "Style Driver";
+        styleLayer.guideLayer = true;
+        styleLayer.enabled = false;
+        var styleEff = styleLayer.Effects.addProperty("ADBE Slider Control");
+        styleEff.name = "Style Index";
+        var styleProp = styleEff.property(1);
 
-        var driver = cursorComp.layers.addNull();
-        driver.name = "Style Driver";
-        driver.guideLayer = true;
-        var styleEffect = driver.Effects.addProperty("ADBE Slider Control");
-        styleEffect.name = "Style Index";
-        var styleSlider = styleEffect.property(1);
-
-        // Build hold-interpolated keyframes from CURSOR_<style> events.
         var styleTimes = [];
         var styleVals  = [];
         for (var ei = 0; ei < events.length; ei++) {
@@ -165,45 +281,88 @@
             }
         }
         if (styleTimes.length === 0) {
-            // No samples (e.g. recorded on non-Windows) — pin to arrow.
             styleTimes = [0];
             styleVals  = [0];
         }
-        styleSlider.setValuesAtTimes(styleTimes, styleVals);
-        for (var ki = 1; ki <= styleSlider.numKeys; ki++) {
-            styleSlider.setInterpolationTypeAtKey(
+        styleProp.setValuesAtTimes(styleTimes, styleVals);
+        for (var ki = 1; ki <= styleProp.numKeys; ki++) {
+            styleProp.setInterpolationTypeAtKey(
                 ki,
                 KeyframeInterpolationType.HOLD,
                 KeyframeInterpolationType.HOLD);
         }
 
-        // Add the 5 cursor sprite layers on top of the driver.
-        for (var sIdx = 0; sIdx < cursorItems.length; sIdx++) {
-            var cl = cursorComp.layers.add(cursorItems[sIdx]);
-            cl.name = CURSOR_FILES[sIdx];
-            // Continuously rasterise so SVG stays crisp at any scale.
-            try { cl.collapseTransformation = true; } catch (e1) {}
-            // Anchor on the hotspot so position == on-screen tip.
-            var tip = CURSOR_TIPS[sIdx];
-            var sourceW = cl.source.width  || 64;
-            var sourceH = cl.source.height || 64;
-            cl.anchorPoint.setValue([sourceW * tip[0], sourceH * tip[1]]);
-            cl.position.setValue([SPRITE_BOX / 2, SPRITE_BOX / 2]);
-            cl.opacity.expression =
-                'var s = thisComp.layer("Style Driver")' +
-                '.effect("Style Index")("Slider");\n' +
-                'Math.round(s) === ' + sIdx + ' ? 100 : 0;';
+        // ── Cursor Position Null (parent for the cursor shapes) ──
+        var cursorNull = recComp.layers.addNull(duration);
+        cursorNull.name = "Cursor Position Null";
+        cursorNull.transform.anchorPoint.setValue([0, 0]);
+        cursorNull.transform.position.expression =
+            'var smo = ' + masterCtrl("Cursor Smoothness", "Slider") + ';\n' +
+            'var sp  = thisComp.layer("Screen Pos");\n' +
+            'var raw = sp.effect("Screen Pos")("Point");\n' +
+            'var p   = raw;\n' +
+            'if (smo > 0.01) {\n' +
+            '    var win = 0.1 + smo * 0.5;\n' +
+            '    var sm  = sp.effect("Screen Pos")("Point").smooth(win, 5);\n' +
+            '    p = [raw[0]*(1-smo) + sm[0]*smo, raw[1]*(1-smo) + sm[1]*smo];\n' +
+            '}\n' +
+            'p;';
+        cursorNull.transform.scale.expression =
+            'var sz = ' + masterCtrl("Cursor Size", "Slider") + ';\n' +
+            'var s  = sz / 500 * 100;\n' +
+            '[s, s];';
+
+        // ── 5 cursor shape layers from Cursor_Sprite.json ────────
+        // Lottie file lists them top-to-bottom in this order:
+        //   Closedhand (idx 4), Openhand (idx 3), Pointinghand (idx 2),
+        //   textcursor (idx 1), Arrow (idx 0).
+        // We add the lowest-index last so Arrow ends up at the top of the
+        // layer stack (visually first in the timeline).
+        var cursorLayers = [];
+        // First, gather Lottie layers by index from STYLE_TO_INDEX so we
+        // don't rely on the file's array order.
+        var byIndex = {};
+        for (var li = 0; li < cursorJson.layers.length; li++) {
+            var L = cursorJson.layers[li];
+            // The bodymovin opacity expression encodes the index, e.g.
+            // "...Math.round(s) === 4 ? 100 : 0...". Parse it back so the
+            // mapping survives reorderings of the file.
+            var ox = L.ks && L.ks.o && L.ks.o.x ? L.ks.o.x : "";
+            var m = ox.match(/===\s*(\d+)/);
+            var idx = m ? parseInt(m[1], 10) : null;
+            if (idx !== null && idx >= 0 && idx <= 4) {
+                byIndex[idx] = L;
+            }
+        }
+        // Add in reverse so index 0 (Arrow) ends up on top.
+        for (var idx = 4; idx >= 0; idx--) {
+            var lLayer = byIndex[idx];
+            if (!lLayer) continue;
+            var opacityExpr =
+                'var s = thisComp.layer("Style Driver").effect("Style Index")("Slider");\n' +
+                'Math.round(s) === ' + idx + ' ? 100 : 0;';
+            var aeLyr = buildCursorLayer(recComp, lLayer, opacityExpr);
+            cursorLayers.push(aeLyr);
         }
 
-        // ── Master comp ───────────────────────────────────────────
+        // Parent the cursor shapes to Cursor Position Null. AE matches by
+        // layer index; refresh after layer additions.
+        var cursorNullIdx = cursorNull.index;
+        for (var ci = 0; ci < cursorLayers.length; ci++) {
+            cursorLayers[ci].parent = cursorNull;
+        }
+
+        // ════════════════════════════════════════════════════════
+        // MAIN COMP
+        // ════════════════════════════════════════════════════════
         var canvasW = 1920;
         var canvasH = 1080;
         var masterComp = proj.items.addComp(
-            "ScreenSee Edit", canvasW, canvasH, 1.0, duration, fps);
+            MASTER_COMP_NAME, canvasW, canvasH, 1.0, duration, fps);
         masterComp.parentFolder = rootFolder;
         masterComp.bgColor = [0.06, 0.06, 0.10];
 
-        // ── Controls null ─────────────────────────────────────────
+        // ── Controls null (will be at bottom; build first) ──────
         var ctrl = masterComp.layers.addNull();
         ctrl.name = "Controls";
         ctrl.guideLayer = true;
@@ -214,51 +373,47 @@
             var e = fx.addProperty("ADBE Slider Control");
             e.name = name;
             e.property(1).setValue(val);
-            return e;
+        }
+        function addPoint(name, xy) {
+            var e = fx.addProperty("ADBE Point Control");
+            e.name = name;
+            e.property(1).setValue(xy);
         }
         function addColor(name, rgb) {
             var e = fx.addProperty("ADBE Color Control");
             e.name = name;
             e.property(1).setValue(rgb);
-            return e;
         }
         function addCheck(name, on) {
             var e = fx.addProperty("ADBE Checkbox Control");
             e.name = name;
             e.property(1).setValue(on ? 1 : 0);
-            return e;
         }
 
         addSlider("Padding",         60);
         addSlider("Roundness",       14);
         addSlider("Shadow",          70);
         addSlider("Glass Halo",      14);
-        addSlider("Background Blur",  0);
-        addColor ("BG Color A", [0.10, 0.16, 0.36]);
-        addColor ("BG Color B", [0.55, 0.32, 0.85]);
-        addSlider("Cursor Size",     36);
-        addSlider("Cursor Smoothness", 0);
-        addCheck ("Auto-hide Cursor", true);
-        addCheck ("Click Ripples",    true);
         addCheck ("Auto Zoom",        false);
         addSlider("Zoom Level",      2.0);
+        addPoint ("Zoom Position",   [0.5, 0.5]);
+        addColor ("BG Color A", [0.10, 0.16, 0.36]);
+        addColor ("BG Color B", [0.55, 0.32, 0.85]);
+        addSlider("Cursor Size",     200);
+        addSlider("Cursor Smoothness", 0);
 
-        // ── Background (gradient + blur) ──────────────────────────
+        // ── Background (solid + Ramp + blur) ────────────────────
         var bg = masterComp.layers.addSolid(
             [0, 0, 0], "Background", canvasW, canvasH, 1.0, duration);
         var ramp = bg.Effects.addProperty("ADBE Ramp");
         ramp.property("Start of Ramp").setValue([canvasW / 2, 0]);
         ramp.property("End of Ramp").setValue([canvasW / 2, canvasH]);
         ramp.property("Start Color").expression =
-            'thisComp.layer("Controls").effect("BG Color A")("Color")';
+            thisCompCtrl("BG Color A", "Color") + ';';
         ramp.property("End Color").expression =
-            'thisComp.layer("Controls").effect("BG Color B")("Color")';
-        var bgBlur = bg.Effects.addProperty("ADBE Gaussian Blur 2");
-        bgBlur.property(1).expression =
-            'thisComp.layer("Controls").effect("Background Blur")("Slider")';
+            thisCompCtrl("BG Color B", "Color") + ';';
 
-        // ── Glass halo (under recording) ──────────────────────────
-        // Soft white plate behind the recording, scale follows recording.
+        // ── Glass Halo (soft white plate under the recording) ────
         var glass = masterComp.layers.addShape();
         glass.name = "Glass Halo";
         var glassRoot = glass.property("ADBE Root Vectors Group");
@@ -267,198 +422,90 @@
         var glassContents = glassGrp.property("ADBE Vectors Group");
         var glassRect = glassContents.addProperty("ADBE Vector Shape - Rect");
         glassRect.property("Size").expression =
-            'var pad = thisComp.layer("Controls").effect("Padding")("Slider");\n' +
-            'var halo = thisComp.layer("Controls").effect("Glass Halo")("Slider");\n' +
-            'var aw = thisComp.width  - pad*2;\n' +
-            'var ah = thisComp.height - pad*2;\n' +
-            'var s  = Math.min(aw / ' + sw + ', ah / ' + sh + ');\n' +
-            '[' + sw + ' * s + halo*2, ' + sh + ' * s + halo*2];';
+            'var pad  = ' + thisCompCtrl("Padding", "Slider") + ';\n' +
+            'var halo = ' + thisCompCtrl("Glass Halo", "Slider") + ';\n' +
+            '[thisComp.width - pad*2 + halo*2, thisComp.height - pad*2 + halo*2];';
         glassRect.property("Roundness").expression =
-            'var r = thisComp.layer("Controls").effect("Roundness")("Slider");\n' +
-            'var halo = thisComp.layer("Controls").effect("Glass Halo")("Slider");\n' +
+            'var r    = ' + thisCompCtrl("Roundness", "Slider") + ';\n' +
+            'var halo = ' + thisCompCtrl("Glass Halo", "Slider") + ';\n' +
             'r + halo / 2;';
         var glassFill = glassContents.addProperty("ADBE Vector Graphic - Fill");
         glassFill.property("Color").setValue([1, 1, 1]);
         glassFill.property("Opacity").setValue(14);
-        glass.position.setValue([canvasW / 2, canvasH / 2]);
-        glass.opacity.expression =
-            'thisComp.layer("Controls").effect("Glass Halo")("Slider") > 0 ? 100 : 0;';
+        glass.transform.position.setValue([canvasW / 2, canvasH / 2]);
+        glass.transform.opacity.expression =
+            'var halo = ' + thisCompCtrl("Glass Halo", "Slider") + ';\n' +
+            'halo > 0 ? 100 : 0;';
         var glassBlur = glass.Effects.addProperty("ADBE Gaussian Blur 2");
         glassBlur.property(1).expression =
-            'thisComp.layer("Controls").effect("Glass Halo")("Slider") / 2;';
+            'var halo = ' + thisCompCtrl("Glass Halo", "Slider") + ';\n' +
+            'halo / 2;';
 
-        // ── Recording layer ───────────────────────────────────────
-        var rec = masterComp.layers.add(rawItem);
+        // ── Recording (precomp instance) ─────────────────────────
+        var rec = masterComp.layers.add(recComp);
         rec.name = "Recording";
-        rec.position.setValue([canvasW / 2, canvasH / 2]);
-        rec.scale.expression =
-            'var pad = thisComp.layer("Controls").effect("Padding")("Slider");\n' +
-            'var aw = thisComp.width  - pad*2;\n' +
-            'var ah = thisComp.height - pad*2;\n' +
-            'var s  = Math.min(aw / ' + sw + ', ah / ' + sh + ') * 100;\n' +
-            'var zoomOn = thisComp.layer("Controls").effect("Auto Zoom")("Checkbox");\n' +
-            'var z      = thisComp.layer("Controls").effect("Zoom Level")("Slider");\n' +
-            'zoomOn > 0.5 ? [s*z, s*z] : [s, s];';
-
+        rec.transform.scale.expression =
+            'var pad    = ' + thisCompCtrl("Padding", "Slider") + ';\n' +
+            'var z      = ' + thisCompCtrl("Zoom Level", "Slider") + ';\n' +
+            'var zoomOn = ' + thisCompCtrl("Auto Zoom", "Checkbox") + ';\n' +
+            'var srcW   = thisLayer.source.width;\n' +
+            'var srcH   = thisLayer.source.height;\n' +
+            'var frameW = thisComp.width  - pad*2;\n' +
+            'var frameH = thisComp.height - pad*2;\n' +
+            'var fit    = Math.max(frameW / srcW, frameH / srcH) * 100;\n' +
+            'zoomOn > 0.5 ? [fit * z, fit * z] : [fit, fit];';
+        rec.transform.position.expression =
+            'var z      = ' + thisCompCtrl("Zoom Level", "Slider") + ';\n' +
+            'var zoomOn = ' + thisCompCtrl("Auto Zoom", "Checkbox") + ';\n' +
+            'var zp     = ' + thisCompCtrl("Zoom Position", "Point") + ';\n' +
+            'var s      = thisLayer.transform.scale[0] / 100;\n' +
+            'var srcW   = thisLayer.source.width;\n' +
+            'var srcH   = thisLayer.source.height;\n' +
+            'var cx = thisComp.width  / 2;\n' +
+            'var cy = thisComp.height / 2;\n' +
+            'if (zoomOn > 0.5 && z > 1) {\n' +
+            '    cx -= (zp[0] - 0.5) * srcW * s;\n' +
+            '    cy -= (zp[1] - 0.5) * srcH * s;\n' +
+            '}\n' +
+            '[cx, cy];';
         var ds = rec.Effects.addProperty("ADBE Drop Shadow");
         ds.property("Opacity").expression =
-            'Math.min(255, thisComp.layer("Controls").effect("Shadow")("Slider") * 2.5);';
+            'Math.min(255, ' + thisCompCtrl("Shadow", "Slider") + ' * 2.5);';
         ds.property("Distance").expression =
-            'thisComp.layer("Controls").effect("Shadow")("Slider") / 8;';
+            thisCompCtrl("Shadow", "Slider") + ' / 8;';
         ds.property("Softness").expression =
-            'thisComp.layer("Controls").effect("Shadow")("Slider") / 3;';
+            thisCompCtrl("Shadow", "Slider") + ' / 3;';
         ds.property("Direction").setValue(180);
 
-        // ── Rounded corner mask (alpha matte for Recording) ──────
-        var mask = masterComp.layers.addShape();
-        mask.name = "Recording Mask";
-        var maskRoot = mask.property("ADBE Root Vectors Group");
-        var maskGrp  = maskRoot.addProperty("ADBE Vector Group");
-        maskGrp.name = "Mask";
-        var maskContents = maskGrp.property("ADBE Vectors Group");
-        var maskRect = maskContents.addProperty("ADBE Vector Shape - Rect");
-        maskRect.property("Size").expression =
-            'var rec = thisComp.layer("Recording");\n' +
-            'var s = rec.transform.scale[0] / 100;\n' +
-            '[' + sw + ' * s, ' + sh + ' * s];';
-        maskRect.property("Roundness").expression =
-            'thisComp.layer("Controls").effect("Roundness")("Slider");';
-        var maskFill = maskContents.addProperty("ADBE Vector Graphic - Fill");
-        maskFill.property("Color").setValue([1, 1, 1]);
-        mask.position.expression =
-            'var rec = thisComp.layer("Recording");\n' +
-            'rec.transform.position;';
-        // Move mask immediately above Recording so trkmat can target it.
-        mask.moveBefore(rec);
+        // ── Recording Matte (size from Padding only — NEVER scales with zoom) ──
+        var matte = masterComp.layers.addShape();
+        matte.name = "Recording Matte";
+        var matteRoot = matte.property("ADBE Root Vectors Group");
+        var matteGrp  = matteRoot.addProperty("ADBE Vector Group");
+        matteGrp.name = "Rectangle 1";
+        var matteContents = matteGrp.property("ADBE Vectors Group");
+        var matteRect = matteContents.addProperty("ADBE Vector Shape - Rect");
+        matteRect.property("Size").expression =
+            'var pad = ' + thisCompCtrl("Padding", "Slider") + ';\n' +
+            '[thisComp.width - pad*2, thisComp.height - pad*2];';
+        matteRect.property("Roundness").expression =
+            thisCompCtrl("Roundness", "Slider") + ';';
+        var matteFill = matteContents.addProperty("ADBE Vector Graphic - Fill");
+        matteFill.property("Color").setValue([1, 1, 1]);
+        matte.transform.position.expression =
+            '[thisComp.width/2, thisComp.height/2];';
+
+        // The matte must sit immediately above Recording for the alpha
+        // matte target. AE auto-stacks new layers on top.
         rec.trackMatteType = TrackMatteType.ALPHA;
 
-        // ── Cursor layer ─────────────────────────────────────────
-        var cursor = masterComp.layers.add(cursorComp);
-        cursor.name = "Cursor";
-        cursor.collapseTransformation = true;
-        cursor.scale.expression =
-            'var sz = thisComp.layer("Controls").effect("Cursor Size")("Slider");\n' +
-            'var s  = sz / 36 * 100;\n' +
-            '[s, s];';
-
-        // Bake MOVE events as Point Control keyframes (in screen coords).
-        var pos = cursor.Effects.addProperty("ADBE Point Control");
-        pos.name = "Screen Pos";
-        var posProp = pos.property(1);
-        var pTimes = [], pVals = [];
-        var lastX = sw / 2, lastY = sh / 2;
-        for (var mi = 0; mi < events.length; mi++) {
-            var em = events[mi];
-            if (em.type === "MOVE") {
-                lastX = em.x - lft;
-                lastY = em.y - top;
-                pTimes.push(em.t);
-                pVals.push([lastX, lastY]);
-            }
-        }
-        if (pTimes.length === 0) {
-            pTimes = [0];
-            pVals  = [[sw / 2, sh / 2]];
-        }
-        posProp.setValuesAtTimes(pTimes, pVals);
-
-        // Cursor canvas position = recording top-left + screen pos * scale.
-        // Smoothness slider linearly interpolates between the raw value and
-        // a smoothMove() over a 0.1..0.6 s window.
-        cursor.position.expression =
-            'var rec = thisComp.layer("Recording");\n' +
-            'var s   = rec.transform.scale[0] / 100;\n' +
-            'var rp  = rec.transform.position;\n' +
-            'var rw  = ' + sw + ' * s;\n' +
-            'var rh  = ' + sh + ' * s;\n' +
-            'var smo = thisComp.layer("Controls").effect("Cursor Smoothness")("Slider");\n' +
-            'var raw = effect("Screen Pos")("Point");\n' +
-            'var p   = raw;\n' +
-            'if (smo > 0.01) {\n' +
-            '  var win = 0.1 + smo * 0.5;\n' +
-            '  var sm  = effect("Screen Pos")("Point").smooth(win, 5);\n' +
-            '  p = [raw[0]*(1-smo) + sm[0]*smo, raw[1]*(1-smo) + sm[1]*smo];\n' +
-            '}\n' +
-            '[rp[0] - rw/2 + p[0]*s, rp[1] - rh/2 + p[1]*s];';
-
-        // Auto-hide: drop opacity when the cursor is idle (~0 px/s).
-        cursor.opacity.expression =
-            'var auto = thisComp.layer("Controls").effect("Auto-hide Cursor")("Checkbox");\n' +
-            'if (auto < 0.5) {\n' +
-            '  100;\n' +
-            '} else {\n' +
-            '  var dt = 0.25;\n' +
-            '  var p1 = effect("Screen Pos")("Point");\n' +
-            '  var p0 = effect("Screen Pos").param("Point").valueAtTime(time - dt);\n' +
-            '  var spd = length(p1, p0) / dt;\n' +
-            '  spd > 1 ? 100 : 0;\n' +
-            '}';
-
-        // ── Click ripples ────────────────────────────────────────
-        // One shape layer per left click; opacity + scale animate from
-        // an in-point set to the click time.
-        var clicks = [];
-        for (var ci3 = 0; ci3 < events.length; ci3++) {
-            if (events[ci3].type === "CLICK_L") {
-                clicks.push(events[ci3]);
-            }
-        }
-        var ripFolder = null;
-        for (var ck = 0; ck < clicks.length; ck++) {
-            var cev = clicks[ck];
-            var sx  = cev.x - lft;
-            var sy  = cev.y - top;
-            var rip = masterComp.layers.addShape();
-            rip.name = "Ripple " + (ck + 1);
-            try { rip.startTime = cev.t; } catch (e2) {}
-            rip.inPoint  = cev.t;
-            rip.outPoint = cev.t + 0.45;
-
-            var rRoot = rip.property("ADBE Root Vectors Group");
-            var rGrp  = rRoot.addProperty("ADBE Vector Group");
-            rGrp.name = "Ripple";
-            var rContents = rGrp.property("ADBE Vectors Group");
-            var ell = rContents.addProperty("ADBE Vector Shape - Ellipse");
-            ell.property("Size").expression =
-                'var t = time - thisLayer.inPoint;\n' +
-                'var p = Math.min(1, Math.max(0, t / 0.45));\n' +
-                'var ease = 1 - Math.pow(1 - p, 2);\n' +
-                'var r = ease * 110;\n' +
-                '[r, r];';
-            var stroke = rContents.addProperty("ADBE Vector Graphic - Stroke");
-            stroke.property("Color").setValue([0.39, 0.59, 1.0]);
-            stroke.property("Stroke Width").setValue(2);
-
-            // Position the ripple at the click point in canvas space.
-            rip.position.expression =
-                'var rec = thisComp.layer("Recording");\n' +
-                'var s   = rec.transform.scale[0] / 100;\n' +
-                'var rp  = rec.transform.position;\n' +
-                'var rw  = ' + sw + ' * s;\n' +
-                'var rh  = ' + sh + ' * s;\n' +
-                '[rp[0] - rw/2 + (' + sx + ') * s, rp[1] - rh/2 + (' + sy + ') * s];';
-
-            rip.opacity.expression =
-                'var on = thisComp.layer("Controls").effect("Click Ripples")("Checkbox");\n' +
-                'if (on < 0.5) 0\n' +
-                'else {\n' +
-                '  var t = time - thisLayer.inPoint;\n' +
-                '  var p = Math.min(1, Math.max(0, t / 0.45));\n' +
-                '  (1 - p) * 100;\n' +
-                '}';
-        }
-
-        // ── Layer order (bottom-up): bg, glass, mask, recording, ripples, cursor ──
-        cursor.moveToBeginning();
-
-        // ── Open & report ─────────────────────────────────────────
         masterComp.openInViewer();
         alert("Imported " + bundle.name + "\n" +
               "  duration: " + duration.toFixed(2) + " s\n" +
               "  cursor samples: " + styleTimes.length + "\n" +
-              "  move events: " + pTimes.length + "\n" +
-              "  clicks: " + clicks.length + "\n\n" +
-              "Tweak the 'Controls' null layer's effects to adjust look.");
+              "  move events: " + pTimes.length + "\n\n" +
+              "Tweak the 'Controls' null in the main comp to adjust the look.\n" +
+              "Set Zoom Position to a normalised point (0..1, [0.5, 0.5] = no pan).");
     } catch (err) {
         alert("Import failed: " + err.toString() +
               (err.stack ? ("\n\n" + err.stack) : ""));
