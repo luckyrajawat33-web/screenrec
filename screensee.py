@@ -1340,11 +1340,8 @@ class App(ctk.CTk):
         self.show_cursor_var  = ctk.BooleanVar(value=True)
         self.autohide_var     = ctk.BooleanVar(value=True)
         self.loop_cursor_var  = ctk.BooleanVar(value=False)
-        self.auto_cursor_var  = ctk.BooleanVar(value=True)
         self.autozoom_var     = ctk.BooleanVar(value=True)
         self.zoomlevel_var    = ctk.DoubleVar(value=2.0)
-        self.cursor_style_var = ctk.StringVar(
-            value="arrow" if HAS_CAIROSVG else "arrow_poly")
         self.bg_tab_var       = ctk.StringVar(value="Gradient")
 
         for v in (self.canvas_var, self.padding_var, self.roundness_var,
@@ -1352,8 +1349,7 @@ class App(ctk.CTk):
                   self.cursor_size_var, self.smooth_var,
                   self.ripple_var, self.show_cursor_var,
                   self.autohide_var, self.loop_cursor_var,
-                  self.autozoom_var, self.zoomlevel_var,
-                  self.cursor_style_var, self.auto_cursor_var):
+                  self.autozoom_var, self.zoomlevel_var):
             v.trace_add("write", lambda *a: self._request_render())
 
     # ── small helpers ──────────────────────────────────────────
@@ -1662,42 +1658,10 @@ class App(ctk.CTk):
 
         # CURSOR
         self._section(parent, "CURSOR")
-        # Style picker — small previews rendered from CURSOR_STYLES.
-        style_row = ctk.CTkFrame(parent, fg_color="transparent")
-        style_row.pack(fill="x", padx=14, pady=(2, 6))
-        self._cursor_style_btns = {}
-        self._cursor_style_imgs = {}     # keep PhotoImage refs alive
-        # SVG-backed cursors first (the realistic ones the user shipped).
-        # If cairosvg failed to import the SVGs can't render — drop them
-        # from the picker so every slot doesn't show the same fallback
-        # arrow.
-        if HAS_CAIROSVG:
-            picker_styles = ["arrow", "pointer", "openhand",
-                              "closedhand", "text"]
-        else:
-            picker_styles = ["arrow_poly"]
-        picker_styles += ["modern", "triangle", "dot", "ring"]
-        for name in picker_styles:
-            sprite, _, _ = _draw_sprite(name, 1.0, 1.0)
-            sprite = sprite.crop(sprite.getbbox() or (0, 0, 32, 32))
-            sprite.thumbnail((26, 26), Image.LANCZOS)
-            pad = Image.new("RGBA", (32, 32), (0, 0, 0, 0))
-            pad.paste(sprite, ((32 - sprite.width)//2,
-                               (32 - sprite.height)//2), sprite)
-            tk_img = ImageTk.PhotoImage(pad)
-            self._cursor_style_imgs[name] = tk_img
-            sel = (name == self.cursor_style_var.get())
-            b = ctk.CTkButton(
-                style_row, text="", image=tk_img,
-                width=42, height=42,
-                fg_color=self.ACCENT if sel else self.PANEL_2,
-                hover_color=self.ACCENT_H, corner_radius=8,
-                command=lambda n=name: self._set_cursor_style(n))
-            b.pack(side="left", padx=2)
-            self._cursor_style_btns[name] = b
+        # Sprite is driven by the live OS cursor (arrow / hand / I-beam /
+        # SIZEALL drag etc.), so there's nothing to pick here.
 
         self._toggle(parent, "Cursor overlay",   self.show_cursor_var)
-        self._toggle(parent, "Match system cursor", self.auto_cursor_var)
         self._slider(parent, "Size",             self.cursor_size_var, 16, 64)
         self._slider(parent, "Smoothness",       self.smooth_var, 0.0, 1.0,
                      fmt=lambda v: f"{float(v):.2f}")
@@ -1760,11 +1724,6 @@ class App(ctk.CTk):
         btn.configure(highlightbackground=self.ACCENT)
         self._request_render()
 
-    def _set_cursor_style(self, name):
-        self.cursor_style_var.set(name)
-        for n, b in self._cursor_style_btns.items():
-            b.configure(fg_color=self.ACCENT if n == name else self.PANEL_2)
-
     # ── settings dict (single source of truth for render+export)
     def _settings(self):
         smooth = float(self.smooth_var.get())
@@ -1793,8 +1752,11 @@ class App(ctk.CTk):
             "bg_type":       self.bg_type,
             "bg_val":        self.bg_val,
             "cursor_size":   int(self.cursor_size_var.get()),
-            "cursor_style":  self.cursor_style_var.get(),
-            "auto_cursor_style": bool(self.auto_cursor_var.get()),
+            # Sprite is always driven by the OS cursor type captured at
+            # record time; "cursor_style" stays as a fallback for frames
+            # before the first sample arrives or on non-Windows hosts.
+            "cursor_style":  "arrow" if HAS_CAIROSVG else "arrow_poly",
+            "auto_cursor_style": True,
             "stiffness":     k / 1200.0,    # downstream multiplies back
             "damping":       b / 90.0,
             "cursor_tilt":   self._cursor_tilt,
