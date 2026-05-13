@@ -47,6 +47,30 @@ except ImportError:
 CURSORS_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "cursors")
 
+# ── Win32 cursor sampling ─────────────────────────────────────
+# Maps the OS cursor handle returned by GetCursorInfo() to one of our
+# CURSOR_STYLES names. Lets the renderer swap sprites to match what the
+# user actually saw on screen (I-beam over text, hand over a link,
+# four-arrow drag, etc.) instead of locking to a single chosen style.
+IS_WINDOWS = sys.platform.startswith("win")
+# Windows IDC_* constants → our sprite names. Cursors we don't have a
+# dedicated sprite for fall back to "arrow" so the overlay never blanks.
+_WIN_IDC_TO_STYLE = {
+    32512: "arrow",      # IDC_ARROW
+    32513: "text",       # IDC_IBEAM
+    32649: "pointer",    # IDC_HAND
+    32646: "openhand",   # IDC_SIZEALL — drag/move
+    32650: "arrow",      # IDC_APPSTARTING
+    32651: "arrow",      # IDC_HELP
+    32514: "arrow",      # IDC_WAIT
+    32515: "arrow",      # IDC_CROSS
+    32642: "arrow",      # IDC_SIZENWSE
+    32643: "arrow",      # IDC_SIZENESW
+    32644: "arrow",      # IDC_SIZEWE
+    32645: "arrow",      # IDC_SIZENS
+    32648: "arrow",      # IDC_NO
+}
+
 # ── Theme
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -416,14 +440,17 @@ def _draw_sprite(style, scale, opacity):
 
 
 def draw_cursor(img_rgba, cx, cy, size=32, opacity=1.0, tilt=0.0,
-                pressed=False, dragging=False, style="arrow"):
+                pressed=False, dragging=False, style="arrow",
+                auto_drag_swap=True):
     # `tilt` is accepted for back-compat but intentionally ignored.
     scale = size / 32.0
     # Automatic state swap: while a drag is in flight (button held +
     # cursor moving) Screen-Studio-style recorders show a closed fist.
-    # closedhand SVG when available, else falls through to whatever
-    # the user picked.
-    eff_style = "closedhand" if dragging else style
+    # Disabled when caller is driving the style from the live OS cursor
+    # — the OS already reports SIZEALL/I-beam/etc. during a drag, and
+    # forcing closedhand on top of that would override real intent
+    # (e.g. text selection should stay as the I-beam).
+    eff_style = "closedhand" if (dragging and auto_drag_swap) else style
     cur, ax, ay = _draw_sprite(eff_style, scale, opacity)
     img_rgba.paste(cur, (int(cx) - ax, int(cy) - ay), cur)
 
@@ -655,6 +682,7 @@ def precompute_track(events, meta, s):
     ev_i        = 0
     ripple_dur  = 0.45
     fired_rips  = []   # list of (t_start, x, y)
+    os_style    = None  # last seen OS cursor style (e.g. "text", "pointer")
 
     for fi in range(n):
         tf = ftimes[fi] if fi < len(ftimes) else fi / fps
@@ -669,6 +697,8 @@ def precompute_track(events, meta, s):
                     fired_rips.append((t, ex, ey))
             elif et == "RELEASE_L":
                 pressed = False
+            elif et.startswith("CURSOR_"):
+                os_style = et[len("CURSOR_"):].lower()
             ev_i += 1
 
         if use_spring:
@@ -730,6 +760,7 @@ def precompute_track(events, meta, s):
             "zoom": z, "zcx": zcx, "zcy": zcy,
             "pressed": pressed, "dragging": dragging,
             "ripples": active_rips,
+            "os_style": os_style,
         })
 
     # Loop cursor position — Screen Studio's "return to start" trick. Over
@@ -800,11 +831,20 @@ def render_frame(raw_bgr, st, s, sw, sh, cw, ch, chrome=None):
                        outline=(100, 150, 255, alpha), width=2)
 
     if st["opacity"] > 0.02 and s.get("show_cursor", True):
+        # When auto-cursor is on, follow whatever the OS cursor was at
+        # capture time (I-beam over text, hand over a link, etc.). Falls
+        # back to the user-picked style for frames before the first
+        # sample arrives or on non-Windows recordings.
+        style = s.get("cursor_style", "arrow")
+        using_os = bool(s.get("auto_cursor_style", True) and st.get("os_style"))
+        if using_os:
+            style = st["os_style"]
         draw_cursor(img, draw_sx, draw_sy,
                     size=s["cursor_size"], opacity=st["opacity"],
                     tilt=st["tilt"],
                     pressed=st["pressed"], dragging=st["dragging"],
-                    style=s.get("cursor_style", "arrow"))
+                    style=style,
+                    auto_drag_swap=not using_os)
 
     # Fast path: caller (App preview / Processor export) precomputed the
     # chrome canvas once. We just paste the per-frame recording onto it.
@@ -863,6 +903,7 @@ class Recorder:
         self._ffmpeg     = None
         self._capture    = None         # windows-capture instance
         self._cap_thread = None         # mss fallback thread
+        self._cur_thread = None         # OS cursor-type sampler thread
 
     def _now(self):
         return time.perf_counter() - self._t0
@@ -902,6 +943,65 @@ class Recorder:
             self._frame_idx += 1
         except (BrokenPipeError, OSError, ValueError):
             self.running = False
+
+    # ── OS cursor-type sampler ─────────────────────────────────
+    # Polls GetCursorInfo at ~30 Hz on Windows and emits a "CURSOR_<style>"
+    # event whenever the active cursor handle changes. Matched against the
+    # standard IDC_* handles loaded once at thread start. No-op on
+    # non-Windows; recordings simply fall back to the user-picked style.
+    def _start_cursor_sampler(self):
+        if not IS_WINDOWS:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except Exception:
+            return
+
+        user32 = ctypes.windll.user32
+
+        class POINT(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+        class CURSORINFO(ctypes.Structure):
+            _fields_ = [("cbSize",       wintypes.DWORD),
+                        ("flags",        wintypes.DWORD),
+                        ("hCursor",      ctypes.c_void_p),
+                        ("ptScreenPos",  POINT)]
+
+        user32.LoadCursorW.restype  = ctypes.c_void_p
+        user32.LoadCursorW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        user32.GetCursorInfo.argtypes = [ctypes.POINTER(CURSORINFO)]
+        user32.GetCursorInfo.restype  = wintypes.BOOL
+
+        handle_to_style = {}
+        for resid, style in _WIN_IDC_TO_STYLE.items():
+            h = user32.LoadCursorW(None, ctypes.c_void_p(resid))
+            if h:
+                handle_to_style[h] = style
+
+        def loop():
+            info = CURSORINFO()
+            info.cbSize = ctypes.sizeof(info)
+            last_style = None
+            interval   = 1.0 / 30.0
+            while self.running:
+                try:
+                    if user32.GetCursorInfo(ctypes.byref(info)):
+                        style = handle_to_style.get(info.hCursor, "arrow")
+                        if style != last_style:
+                            last_style = style
+                            with self._lock:
+                                self._events.append(
+                                    (self._now(), f"CURSOR_{style.upper()}",
+                                     int(info.ptScreenPos.x),
+                                     int(info.ptScreenPos.y)))
+                except Exception:
+                    return
+                time.sleep(interval)
+
+        self._cur_thread = threading.Thread(target=loop, daemon=True)
+        self._cur_thread.start()
 
     # ── Backend 1: Windows.Graphics.Capture (cursor excluded) ──
     def _start_wgc(self, region):
@@ -1017,6 +1117,8 @@ class Recorder:
             on_scroll=self._on_scroll)
         self._listener.start()
 
+        self._start_cursor_sampler()
+
     def stop(self):
         self.running = False
         if self._listener:
@@ -1027,6 +1129,8 @@ class Recorder:
             except Exception: pass
         if self._cap_thread:
             self._cap_thread.join(timeout=2.0)
+        if self._cur_thread:
+            self._cur_thread.join(timeout=1.0)
         if self._ffmpeg:
             try: self._ffmpeg.stdin.close()
             except Exception: pass
@@ -1236,6 +1340,7 @@ class App(ctk.CTk):
         self.show_cursor_var  = ctk.BooleanVar(value=True)
         self.autohide_var     = ctk.BooleanVar(value=True)
         self.loop_cursor_var  = ctk.BooleanVar(value=False)
+        self.auto_cursor_var  = ctk.BooleanVar(value=True)
         self.autozoom_var     = ctk.BooleanVar(value=True)
         self.zoomlevel_var    = ctk.DoubleVar(value=2.0)
         self.cursor_style_var = ctk.StringVar(
@@ -1248,7 +1353,7 @@ class App(ctk.CTk):
                   self.ripple_var, self.show_cursor_var,
                   self.autohide_var, self.loop_cursor_var,
                   self.autozoom_var, self.zoomlevel_var,
-                  self.cursor_style_var):
+                  self.cursor_style_var, self.auto_cursor_var):
             v.trace_add("write", lambda *a: self._request_render())
 
     # ── small helpers ──────────────────────────────────────────
@@ -1592,6 +1697,7 @@ class App(ctk.CTk):
             self._cursor_style_btns[name] = b
 
         self._toggle(parent, "Cursor overlay",   self.show_cursor_var)
+        self._toggle(parent, "Match system cursor", self.auto_cursor_var)
         self._slider(parent, "Size",             self.cursor_size_var, 16, 64)
         self._slider(parent, "Smoothness",       self.smooth_var, 0.0, 1.0,
                      fmt=lambda v: f"{float(v):.2f}")
@@ -1688,6 +1794,7 @@ class App(ctk.CTk):
             "bg_val":        self.bg_val,
             "cursor_size":   int(self.cursor_size_var.get()),
             "cursor_style":  self.cursor_style_var.get(),
+            "auto_cursor_style": bool(self.auto_cursor_var.get()),
             "stiffness":     k / 1200.0,    # downstream multiplies back
             "damping":       b / 90.0,
             "cursor_tilt":   self._cursor_tilt,
