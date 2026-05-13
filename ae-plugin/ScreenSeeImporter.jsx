@@ -176,8 +176,16 @@
         var ks = lottieLayer.ks;
         if (ks.a && ks.a.k)
             shapeLyr.transform.anchorPoint.setValue([ks.a.k[0], ks.a.k[1]]);
-        if (ks.s && ks.s.k)
-            shapeLyr.transform.scale.setValue([ks.s.k[0], ks.s.k[1]]);
+        // Scale = Lottie's intrinsic scale × (Cursor Size / 500). The
+        // Lottie file ships sprites at 1343.7% so the artwork fills its
+        // 500-unit canvas; dividing the slider by 500 makes "Cursor
+        // Size = 500" identical to the sprite's natural render size.
+        var lx = (ks.s && ks.s.k) ? ks.s.k[0] : 100;
+        var ly = (ks.s && ks.s.k) ? ks.s.k[1] : 100;
+        shapeLyr.transform.scale.expression =
+            'var sz = thisComp.layer("Style Driver").effect("Cursor Size")("Slider");\n' +
+            'var k = sz / 500;\n' +
+            '[' + lx + ' * k, ' + ly + ' * k];';
         if (ks.r && typeof ks.r.k === "number")
             shapeLyr.transform.rotation.setValue(ks.r.k);
         shapeLyr.transform.opacity.expression = opacityExpr;
@@ -187,16 +195,19 @@
             addShapeItem(contents, lottieLayer.shapes[si]);
         }
 
-        // Parent first, *then* zero out position so [0, 0] is in PARENT
-        // space (i.e. the cursor's anchor lands exactly at the null's
-        // position). Setting position before parenting makes AE
-        // recompute it to preserve world coords, leaving each cursor
-        // stranded at (0, 0) of the precomp — which is why every cursor
-        // had to be re-aligned by hand on the previous import.
+        // Wire the cursor to the Cursor Position Null by expression
+        // rather than parenting. Parenting works in the UI but the
+        // scripted version is flaky across AE versions (returns
+        // "Object is invalid" on .parent assignment when the source
+        // layer was added in the same script run). An expression on
+        // Position avoids the issue entirely AND survives the user
+        // re-parenting later if they prefer.
         if (parentLayer) {
-            shapeLyr.parent = parentLayer;
+            shapeLyr.transform.position.expression =
+                'thisComp.layer("' + parentLayer.name + '").transform.position;';
+        } else {
+            shapeLyr.transform.position.setValue([0, 0]);
         }
-        shapeLyr.transform.position.setValue([0, 0]);
         return shapeLyr;
     }
 
@@ -275,15 +286,17 @@
         styleLayer.name = "Style Driver";
         styleLayer.guideLayer = true;
         styleLayer.enabled = false;
-        var styleEff = styleLayer.Effects.addProperty("ADBE Slider Control");
-        styleEff.name = "Style Index";
-        var styleProp = styleEff.property(1);
-        var sizeEff = styleLayer.Effects.addProperty("ADBE Slider Control");
-        sizeEff.name = "Cursor Size";
-        sizeEff.property(1).setValue(200);
-        var smoEff = styleLayer.Effects.addProperty("ADBE Slider Control");
-        smoEff.name = "Cursor Smoothness";
-        smoEff.property(1).setValue(0);
+        // Add all three sliders FIRST, then re-acquire fresh property
+        // references before doing anything (keyframe writes especially)
+        // — keeping a Property handle across subsequent addProperty()
+        // calls invalidates it in some AE versions and surfaces as
+        // "ReferenceError: Object is invalid" on the first setValue.
+        styleLayer.Effects.addProperty("ADBE Slider Control").name = "Style Index";
+        styleLayer.Effects.addProperty("ADBE Slider Control").name = "Cursor Size";
+        styleLayer.Effects.addProperty("ADBE Slider Control").name = "Cursor Smoothness";
+        styleLayer.Effects.property("Cursor Size").property(1).setValue(200);
+        styleLayer.Effects.property("Cursor Smoothness").property(1).setValue(0);
+        var styleProp = styleLayer.Effects.property("Style Index").property(1);
 
         var styleTimes = [];
         var styleVals  = [];
@@ -326,10 +339,10 @@
             '    p = [raw[0]*(1-smo) + sm[0]*smo, raw[1]*(1-smo) + sm[1]*smo];\n' +
             '}\n' +
             'p;';
-        cursorNull.transform.scale.expression =
-            'var sz = thisComp.layer("Style Driver").effect("Cursor Size")("Slider");\n' +
-            'var s  = sz / 500 * 100;\n' +
-            '[s, s];';
+        // Scale is left at default; the cursors expression-link their
+        // Position to this null but compute Scale from Cursor Size on
+        // Style Driver directly. This avoids a chained dependency and
+        // keeps the null purely as a position anchor.
 
         // ── 5 cursor shape layers from Cursor_Sprite.json ────────
         // Lottie file lists them top-to-bottom in this order:
@@ -526,8 +539,20 @@
               "BG Color A / B.\n" +
               "Recording precomp 'Style Driver': Style Index, Cursor Size, Cursor Smoothness.");
     } catch (err) {
-        alert("Import failed: " + err.toString() +
-              (err.stack ? ("\n\n" + err.stack) : ""));
+        var detail = "Import failed: " + err.toString();
+        if (typeof err.line !== "undefined" && err.line !== null) {
+            detail += "\nLine: " + err.line;
+        }
+        if (err.source) {
+            // Show the offending source line; ExtendScript fills this in
+            // for syntax / reference errors.
+            var lines = String(err.source).split("\n");
+            var li = (typeof err.line === "number") ? err.line - 1 : -1;
+            if (li >= 0 && li < lines.length) {
+                detail += "\n  >> " + lines[li].replace(/^\s+|\s+$/g, "");
+            }
+        }
+        alert(detail);
     }
     app.endUndoGroup();
 })();
