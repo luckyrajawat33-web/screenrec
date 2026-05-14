@@ -54,7 +54,7 @@ Top to bottom in the timeline:
 
 | Layer (top → bottom)   | Role                                                          |
 |------------------------|---------------------------------------------------------------|
-| cursor sprites         | One shape layer per cursor in `Cursor_Sprite.json`, ordered by index — arrow on top. Each shows when the effective Style Index equals its slot. |
+| cursor sprites         | One shape layer per cursor in `Cursor_Sprite.json`, ordered by index — arrow on top. Each shows when the `Cursor Style` index equals its slot. |
 | `Cursor Position Null` | Position = Screen Pos (+ Smoothness). Cursors expression-link their Position to this null so their anchor (hotspot) lands exactly on it. |
 | `Style Driver`         | Holds the cursor controls — see below. |
 | `Screen Pos`           | Point Control "Screen Pos" — linear-keyed from MOVE events, times remapped through `frame_times`. |
@@ -64,18 +64,18 @@ Top to bottom in the timeline:
 
 | Control            | Role                                                          |
 |--------------------|---------------------------------------------------------------|
-| `Auto Cursor`      | Checkbox, default **on**. On = the cursor follows the **Recorded Style** track (the OS cursor changes captured during recording — arrow → I-beam over text, hand over links, closed hand while dragging). Off = the cursor uses the manual **Cursor Style** picker. |
-| `Cursor Style`     | Manual picker. A **Dropdown Menu Control** (AE 2020+) listing `Hidden` + every sprite in `Cursor_Sprite.json`; on older AE it falls back to a whole-number slider. |
-| `Recorded Style`   | Hold-keyed track baked from the recorder's `CURSOR_<style>` events. Drives the cursor when Auto Cursor is on. |
+| `Cursor Style`     | The single cursor picker. A **Dropdown Menu Control** (AE 2020+; whole-number slider fallback on older AE) listing `Auto (Recorded)`, `Hidden`, and every sprite in `Cursor_Sprite.json`. It is **hold-keyed straight from the recorder's `CURSOR_<style>` events**, so out of the box the cursor auto-follows what the OS actually showed — arrow → I-beam over text, hand over links, closed hand while dragging. To pin one cursor for the whole clip, delete its keyframes (select the property → Delete) and pick a value. |
 | `Cursor Size`      | Cursor sprite size — each cursor's scale = Lottie intrinsic × `Cursor Size / 500`. |
 | `Cursor Smoothness`| 0 = exact follow. >0 blends in `.smooth(0.1 + s × 0.5, 5)`. |
 
-**Style Index:** `1` = Hidden, `2 .. N+1` = the cursor sprites in
-`Cursor_Sprite.json` index order. Both the dropdown and the recorded
-track use this numbering. **Adding a new cursor:** drop another layer
-into `Cursor_Sprite.json` (give its opacity expression a unique
-`=== <n>` index, or just let array order decide) and re-import — it
-automatically joins the dropdown and gets its own shape layer.
+**Cursor Style index:** `1` = Auto (Recorded), `2` = Hidden,
+`3 .. N+2` = the cursor sprites in `Cursor_Sprite.json` index order.
+Index `1` is only ever seen on recordings with no cursor samples
+(e.g. non-Windows) — the sprites treat it as "show the first cursor".
+**Adding a new cursor:** drop another layer into `Cursor_Sprite.json`
+(give its opacity expression a unique `=== <n>` index, or just let
+array order decide) and re-import — it automatically joins the
+dropdown and gets its own shape layer.
 
 Cursor shapes are baked from `Cursor_Sprite.json` so the file is
 self-contained: paths, fills, strokes are reproduced as native AE
@@ -97,9 +97,7 @@ Controls**. Every parameter is keyframable.
 | Zoom Level          | 1.0                | Main comp / Controls    | Scale multiplier on the Recording precomp, **clamped to 1.0–2.0**. 1.0 = no zoom, fits inside matte. >1 zooms in with the matte clipping the overflow. Values outside the range snap back to the nearest bound. |
 | Zoom Position       | (0.5, 0.5)         | Main comp / Controls    | Normalised pan target, **clamped to 0–1 on each axis**. Pan range = `max(0, zoomedSize − matteSize)`, so at Zoom Level 1 the slider has no effect; at >1, 0 puts the source's leading edge flush to the matte edge, 0.5 = centred, 1 = trailing edge flush. It can never expose empty matte. |
 | BG Color A / B      | indigo / violet    | Main comp / Controls    | Top + bottom of the background gradient.                |
-| Auto Cursor         | on                 | Recording / Style Driver | On = cursor follows the recorded OS-cursor changes (`Recorded Style`); off = follows the manual `Cursor Style` picker. |
-| Cursor Style        | first sprite       | Recording / Style Driver | Manual cursor picker — a dropdown of `Hidden` + every sprite (slider fallback on pre-2020 AE). Only used when Auto Cursor is off. |
-| Recorded Style      | keyed              | Recording / Style Driver | Hold-keyed track baked from the recorder's `CURSOR_<style>` events. Used when Auto Cursor is on. |
+| Cursor Style        | keyed (recorded)   | Recording / Style Driver | The single cursor picker — a dropdown of `Auto (Recorded)`, `Hidden`, and every sprite (slider fallback on pre-2020 AE). Hold-keyed from the recorder's `CURSOR_<style>` events, so it auto-follows the real OS cursor. Delete its keyframes to pin one cursor for the whole clip. |
 | Cursor Size         | 200                | Recording / Style Driver | Cursor sprite size. Each cursor's scale = Lottie intrinsic × `Cursor Size / 500`. |
 | Cursor Smoothness   | 0                  | Recording / Style Driver | 0 = exact follow. >0 blends in `.smooth(0.1 + s × 0.5, 5)`. |
 
@@ -138,16 +136,17 @@ comp's render fps.
 - **Zoom is uniform**, not per-click. Animate Zoom Level / Zoom
   Position keyframes manually around click points, or use the
   auto-pan-to-cursor expression above.
-- **Cursor sprites are data-driven**: the dropdown and the Style Index
-  numbering come straight from `Cursor_Sprite.json`. Add or reorder
-  sprites there and re-import — no script edits. The recorder side
-  (`PYTHON_STYLE_TO_JSONIDX` in the script) only needs touching if you
-  also teach `screensee.py` to emit a brand-new `CURSOR_<style>` event.
+- **Cursor sprites are data-driven**: the dropdown and the `Cursor
+  Style` index numbering come straight from `Cursor_Sprite.json`. Add
+  or reorder sprites there and re-import — no script edits. The
+  recorder side (`PYTHON_STYLE_TO_JSONIDX` in the script) only needs
+  touching if you also teach `screensee.py` to emit a brand-new
+  `CURSOR_<style>` event.
 - **Drag tracking**: the recorder emits a one-shot `CURSOR_CLOSEDHAND`
   the moment a held-button drag starts and re-samples the real OS
-  cursor when it ends, so with Auto Cursor on the overlay shows the
-  grab cursor through drags. Cursor *position* during drags already
-  comes through the normal MOVE stream.
+  cursor when it ends, so the overlay shows the grab cursor through
+  drags then reverts. Cursor *position* during drags already comes
+  through the normal MOVE stream.
 
 ## Troubleshooting
 
@@ -168,6 +167,8 @@ comp's render fps.
 - **Cursor too big / too small** — adjust `Cursor Size` on the
   `Style Driver` layer. Each cursor's scale = Lottie intrinsic ×
   `Cursor Size / 500`.
-- **Cursor won't change automatically** — check `Auto Cursor` is on
-  (Style Driver). With it off, the cursor follows the manual
-  `Cursor Style` dropdown instead of the recorded track.
+- **Cursor won't change automatically** — the `Cursor Style` property
+  on `Style Driver` should have hold keyframes (the recorded track). If
+  it's a single static value, the recording had no cursor samples
+  (non-Windows capture) or its keyframes were deleted — re-import the
+  bundle, or keyframe `Cursor Style` by hand.

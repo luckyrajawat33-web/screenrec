@@ -1185,11 +1185,16 @@ class Recorder:
             try: self._ffmpeg.wait(timeout=15)
             except subprocess.TimeoutExpired: self._ffmpeg.kill()
 
-        # Persist event + meta tracks alongside raw.mkv
+        # Persist event + meta tracks alongside raw.mkv. Events are
+        # appended from three threads (mouse listener, cursor sampler,
+        # capture) so they can land slightly out of order — sort by
+        # timestamp so consumers (precompute_track, the AE importer's
+        # setValuesAtTimes) get a monotonic stream.
         with self._lock:
             events_out = [
                 {"t": t, "type": et, "x": x, "y": y}
-                for (t, et, x, y) in self._events
+                for (t, et, x, y) in sorted(self._events,
+                                            key=lambda e: e[0])
             ]
         with open(os.path.join(self.bundle_path, "events.json"), "w") as f:
             json.dump(events_out, f)
