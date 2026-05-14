@@ -43,11 +43,12 @@ Top to bottom in the timeline:
 
 | Layer            | Role                                                         |
 |------------------|--------------------------------------------------------------|
-| `Recording Matte`| Rounded rectangle. **Size depends only on Padding/Roundness.** Never scales with zoom. Acts as alpha matte for Recording. |
+| `Recording Matte`| Rounded rectangle sized to the recording's **fit size** (the footprint it renders at with Zoom Level 1) — the recording precomp's exact footprint with rounded corners. Never reacts to zoom. Acts as alpha matte for Recording. |
 | `Recording`      | Instance of the Recording precomp. Track Matte = Alpha. Scale + Position driven by Zoom Level / Zoom Position. |
-| `Glass Halo`     | Soft white plate behind the recording — size + position track the Recording layer. |
-| `Background`     | Solid + Ramp gradient (BG Color A → B) + Gaussian Blur.      |
-| `Controls`       | Disabled null layer holding every adjustable slider/checkbox/point/color. |
+| `Recording Shadow`| Rounded rectangle the exact size of the matte, sitting just below the recording. Has a Drop Shadow (Shadow-Only, Distance 0) so the blurred edge casts past the matte. The **Shadow** slider drives its Softness — a real, visible shadow the alpha matte can't clip. |
+| `Glass Halo`     | Soft white plate behind the recording. Size = recording fit size + halo on every edge; position is the fixed comp centre. **Zoom-independent** — only the footage inside the matte zooms. |
+| `Background`     | Solid + Ramp gradient (BG Color A → B).                      |
+| `Controls`       | Disabled null layer holding every adjustable slider/point/color. |
 
 ### Recording precomp — `Recording` (source resolution, e.g. 2560×1440)
 
@@ -82,9 +83,9 @@ Controls**. Every parameter is keyframable.
 | Effect              | Default            | Lives on                | What it does                                            |
 |---------------------|--------------------|-------------------------|---------------------------------------------------------|
 | Padding             | 60                 | Main comp / Controls    | Empty space between recording and canvas edge. Recording is fit (not cover-cropped) inside the matte. |
-| Roundness           | 14                 | Main comp / Controls    | Recording corner radius (also affects the matte and halo). |
-| Shadow              | 70                 | Main comp / Controls    | Drop-shadow opacity / distance / softness.              |
-| Glass Halo          | 14                 | Main comp / Controls    | Width of the soft white plate behind the recording (no blur — keeps the edge crisp). Size + position track the Recording layer, so the halo always matches the recording's aspect ratio and follows it as Padding changes. |
+| Roundness           | 14                 | Main comp / Controls    | Corner radius — shared by the matte, the shadow plate, and the halo so the rounded corners stay concentric. |
+| Shadow              | 70                 | Main comp / Controls    | Softness of the `Recording Shadow` layer's drop shadow (Distance is fixed at 0, Opacity fixed). 0 = no visible shadow; higher = softer/wider. |
+| Glass Halo          | 14                 | Main comp / Controls    | Width of the soft white plate behind the recording (no blur — keeps the edge crisp). Size = recording fit size + halo on every edge, position fixed at comp centre — **does not react to zoom**. |
 | Zoom Level          | 1.0                | Main comp / Controls    | Scale multiplier on the Recording precomp, **clamped to 1.0–2.0**. 1.0 = no zoom, fits inside matte. >1 zooms in with the matte clipping the overflow. Values outside the range snap back to the nearest bound. |
 | Zoom Position       | (0.5, 0.5)         | Main comp / Controls    | Normalised pan target, **clamped to 0–1 on each axis**. Pan range = `max(0, zoomedSize − matteSize)`, so at Zoom Level 1 the slider has no effect; at >1, 0 puts the source's leading edge flush to the matte edge, 0.5 = centred, 1 = trailing edge flush. It can never expose empty matte. |
 | BG Color A / B      | indigo / violet    | Main comp / Controls    | Top + bottom of the background gradient.                |
@@ -94,11 +95,11 @@ Controls**. Every parameter is keyframable.
 
 ## How zoom works (and why the matte stays put)
 
-- `Recording Matte` size = `[comp.width - pad*2, comp.height - pad*2]`. Padding and Roundness only — never zoom.
+- `Recording Matte`, `Recording Shadow`, and `Glass Halo` all derive their size from one shared expression: `fit = Math.min(frameW/srcW, frameH/srcH)` — the recording's footprint at Zoom Level 1. None of them reference Zoom Level or Zoom Position, so they never move or resize when you zoom.
 - `Recording` Scale = `Math.min(frameW/srcW, frameH/srcH) * 100 * clamp(Zoom Level, 1, 2)`. `Math.min` so the source **fits** inside the matte instead of cover-cropping it at Zoom Level 1.
 - `Recording` Position offsets by `(clamp(Zoom Position, 0, 1) - 0.5) * max(0, scaledSrc - frame)`. The pan amount is the actual overflow past the matte, and Zoom Position is clamped to 0–1, so the recording edge can never pull inside the matte no matter what value is dialled in.
 
-The matte stays a fixed rounded rectangle; the recording slides inside it.
+Only the footage precomp scales and pans; the matte, shadow, and halo stay locked together as a fixed rounded rectangle, and the recording slides inside it.
 
 ## Auto-pan to cursor (optional)
 

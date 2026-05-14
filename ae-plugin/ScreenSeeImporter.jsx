@@ -242,16 +242,26 @@
         if (!duration || duration <= 0) duration = bundleDur;
 
         // ════════════════════════════════════════════════════════
-        // RECORDING PRECOMP  (source-resolution canvas)
+        // RECORDING PRECOMP  (sized to the *encoded* footage, which can
+        // differ from meta.json's region by a pixel or two when ffmpeg
+        // rounds to even dimensions — using the real footage size keeps
+        // the cursor overlay pixel-aligned with the screen capture).
         // ════════════════════════════════════════════════════════
+        var footW = rawItem.width  || sw;
+        var footH = rawItem.height || sh;
+        // MOVE events are in capture-region pixels; scale them into the
+        // footage's pixel space so the cursor lands on the right pixel
+        // even if the two resolutions differ.
+        var coordSX = footW / sw;
+        var coordSY = footH / sh;
         var recComp = proj.items.addComp(
-            RECORDING_COMP_NAME, sw, sh, 1.0, duration, fps);
+            RECORDING_COMP_NAME, footW, footH, 1.0, duration, fps);
         recComp.parentFolder = rootFolder;
 
         // ── Footage layer (bottom) ──────────────────────────────
         var footage = recComp.layers.add(rawItem);
         footage.name = "Screen Recording Footage";
-        footage.transform.position.setValue([sw / 2, sh / 2]);
+        footage.transform.position.setValue([footW / 2, footH / 2]);
 
         // ── Screen Pos null with Point Control, keyed from MOVE events
         var screenPosLayer = recComp.layers.addNull(duration);
@@ -263,19 +273,19 @@
         var screenPosProp = screenPosEff.property(1);
 
         var pTimes = [], pVals = [];
-        var lastX = sw / 2, lastY = sh / 2;
+        var lastX = footW / 2, lastY = footH / 2;
         for (var mi = 0; mi < events.length; mi++) {
             var em = events[mi];
             if (em.type === "MOVE") {
-                lastX = em.x - lft;
-                lastY = em.y - topY;
+                lastX = (em.x - lft) * coordSX;
+                lastY = (em.y - topY) * coordSY;
                 pTimes.push(em.t);
                 pVals.push([lastX, lastY]);
             }
         }
         if (pTimes.length === 0) {
             pTimes = [0];
-            pVals  = [[sw / 2, sh / 2]];
+            pVals  = [[footW / 2, footH / 2]];
         }
         screenPosProp.setValuesAtTimes(pTimes, pVals);
 
@@ -444,6 +454,20 @@
         fx.property("Zoom Level").property(1).expression =
             "Math.max(1, Math.min(2, value));";
 
+        // Shared expression fragment: computes the recording's *fit*
+        // size — what it would render at with Zoom Level 1 — leaving
+        // `fit`, `srcW`, `srcH` in scope. The matte, the shadow shape,
+        // and the glass halo all derive their size from this so they
+        // stay locked to one another and never react to zoom.
+        var FIT_SIZE_EXPR =
+            'var pad = ' + thisCompCtrl("Padding", "Slider") + ';\n' +
+            'var rec = thisComp.layer("Recording");\n' +
+            'var srcW = rec.source.width;\n' +
+            'var srcH = rec.source.height;\n' +
+            'var frameW = thisComp.width  - pad*2;\n' +
+            'var frameH = thisComp.height - pad*2;\n' +
+            'var fit = Math.min(frameW / srcW, frameH / srcH);\n';
+
         // ── Background (solid + Ramp + blur) ────────────────────
         var bg = masterComp.layers.addSolid(
             [0, 0, 0], "Background", canvasW, canvasH, 1.0, duration);
@@ -456,9 +480,10 @@
             thisCompCtrl("BG Color B", "Color") + ';';
 
         // ── Glass Halo (soft white plate under the recording) ────
-        // Size + position track the Recording layer directly so the
-        // halo always matches the recording's aspect ratio and follows
-        // it when Padding (and therefore the fit scale) changes.
+        // Size = recording FIT size (zoom-independent) + halo on every
+        // edge; position is the fixed comp centre. The halo never
+        // reacts to Zoom Level or Zoom Position — only the footage
+        // precomp zooms.
         var glass = masterComp.layers.addShape();
         glass.name = "Glass Halo";
         var glassRoot = glass.property("ADBE Root Vectors Group");
@@ -467,25 +492,52 @@
         var glassContents = glassGrp.property("ADBE Vectors Group");
         var glassRect = glassContents.addProperty("ADBE Vector Shape - Rect");
         glassRect.property("Size").expression =
-            'var rec  = thisComp.layer("Recording");\n' +
-            'var s    = rec.transform.scale[0] / 100;\n' +
+            FIT_SIZE_EXPR +
             'var halo = ' + thisCompCtrl("Glass Halo", "Slider") + ';\n' +
-            '[rec.source.width * s + halo*2, rec.source.height * s + halo*2];';
+            '[srcW * fit + halo*2, srcH * fit + halo*2];';
         glassRect.property("Roundness").expression =
             'var r    = ' + thisCompCtrl("Roundness", "Slider") + ';\n' +
             'var halo = ' + thisCompCtrl("Glass Halo", "Slider") + ';\n' +
-            'r + halo / 2;';
+            'r + halo;';
         var glassFill = glassContents.addProperty("ADBE Vector Graphic - Fill");
         glassFill.property("Color").setValue([1, 1, 1]);
         glassFill.property("Opacity").setValue(14);
-        glass.transform.position.expression =
-            'thisComp.layer("Recording").transform.position;';
+        glass.transform.position.setValue([canvasW / 2, canvasH / 2]);
         glass.transform.opacity.expression =
             'var halo = ' + thisCompCtrl("Glass Halo", "Slider") + ';\n' +
             'halo > 0 ? 100 : 0;';
-        // No Gaussian blur — the blur was bleeding into the rounded
-        // corners and softening the edge of the recording itself. The
-        // halo is now a crisp rounded rectangle with low fill opacity.
+
+        // ── Recording Shadow (cast behind the recording) ─────────
+        // A rounded rectangle the exact size of the matte. The Drop
+        // Shadow effect runs in Shadow-Only mode with Distance 0, so
+        // the shadow sits dead-centre behind the recording and only
+        // its blurred edge peeks out past the matte. The Shadow slider
+        // drives Softness alone — a real, visible shadow that the
+        // alpha matte can't clip (because this layer isn't matted).
+        var shadowLyr = masterComp.layers.addShape();
+        shadowLyr.name = "Recording Shadow";
+        var shRoot = shadowLyr.property("ADBE Root Vectors Group");
+        var shGrp  = shRoot.addProperty("ADBE Vector Group");
+        shGrp.name = "Shadow Plate";
+        var shContents = shGrp.property("ADBE Vectors Group");
+        var shRect = shContents.addProperty("ADBE Vector Shape - Rect");
+        shRect.property("Size").expression =
+            FIT_SIZE_EXPR + '[srcW * fit, srcH * fit];';
+        shRect.property("Roundness").expression =
+            thisCompCtrl("Roundness", "Slider") + ';';
+        var shFill = shContents.addProperty("ADBE Vector Graphic - Fill");
+        shFill.property("Color").setValue([0, 0, 0]);
+        shadowLyr.transform.position.setValue([canvasW / 2, canvasH / 2]);
+        var sds = shadowLyr.Effects.addProperty("ADBE Drop Shadow");
+        sds.property("Shadow Color").setValue([0, 0, 0]);
+        sds.property("Opacity").setValue(190);
+        sds.property("Direction").setValue(0);
+        sds.property("Distance").setValue(0);
+        sds.property("Softness").expression =
+            thisCompCtrl("Shadow", "Slider") + ';';
+        // "Shadow Only" so the black plate itself never renders — only
+        // its shadow does.
+        sds.property("Shadow Only").setValue(1);
 
         // ── Recording (precomp instance) ─────────────────────────
         var rec = masterComp.layers.add(recComp);
@@ -527,16 +579,15 @@
             'var zy = Math.max(0, Math.min(1, zp[1]));\n' +
             '[thisComp.width/2  - (zx - 0.5) * panW,\n' +
             ' thisComp.height/2 - (zy - 0.5) * panH];';
-        var ds = rec.Effects.addProperty("ADBE Drop Shadow");
-        ds.property("Opacity").expression =
-            'Math.min(255, ' + thisCompCtrl("Shadow", "Slider") + ' * 2.5);';
-        ds.property("Distance").expression =
-            thisCompCtrl("Shadow", "Slider") + ' / 8;';
-        ds.property("Softness").expression =
-            thisCompCtrl("Shadow", "Slider") + ' / 3;';
-        ds.property("Direction").setValue(180);
+        // No Drop Shadow on the Recording layer itself — the alpha
+        // matte would clip it to nothing. The dedicated "Recording
+        // Shadow" layer below handles the shadow instead.
 
-        // ── Recording Matte (size from Padding only — NEVER scales with zoom) ──
+        // ── Recording Matte ──────────────────────────────────────
+        // Size = the recording's FIT size (zoom-independent), so the
+        // matte is exactly the recording precomp's footprint with
+        // rounded corners. It never reacts to Zoom Level / Zoom
+        // Position; only the footage inside zooms and the matte clips.
         var matte = masterComp.layers.addShape();
         matte.name = "Recording Matte";
         var matteRoot = matte.property("ADBE Root Vectors Group");
@@ -545,8 +596,7 @@
         var matteContents = matteGrp.property("ADBE Vectors Group");
         var matteRect = matteContents.addProperty("ADBE Vector Shape - Rect");
         matteRect.property("Size").expression =
-            'var pad = ' + thisCompCtrl("Padding", "Slider") + ';\n' +
-            '[thisComp.width - pad*2, thisComp.height - pad*2];';
+            FIT_SIZE_EXPR + '[srcW * fit, srcH * fit];';
         matteRect.property("Roundness").expression =
             thisCompCtrl("Roundness", "Slider") + ';';
         var matteFill = matteContents.addProperty("ADBE Vector Graphic - Fill");
