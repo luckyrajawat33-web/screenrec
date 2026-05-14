@@ -925,6 +925,8 @@ class Recorder:
         self._capture    = None         # windows-capture instance
         self._cap_thread = None         # mss fallback thread
         self._cur_thread = None         # OS cursor-type sampler thread
+        self._left_down  = False        # left mouse button currently held
+        self._drag_active = False       # a held-button drag is in progress
 
     def _now(self):
         return time.perf_counter() - self._t0
@@ -934,6 +936,16 @@ class Recorder:
         if self.running:
             with self._lock:
                 self._events.append((self._now(), "MOVE", x, y))
+            # A move while the left button is held is a drag. Emit a
+            # one-shot CURSOR_CLOSEDHAND so the editor can swap to the
+            # grab cursor — the OS rarely exposes a "dragging" cursor
+            # handle of its own. The cursor sampler re-emits the real
+            # OS style when the drag ends (see _start_cursor_sampler).
+            if self._left_down and not self._drag_active:
+                self._drag_active = True
+                with self._lock:
+                    self._events.append(
+                        (self._now(), "CURSOR_CLOSEDHAND", x, y))
 
     def _on_click(self, x, y, button, pressed):
         if self.running:
@@ -941,6 +953,10 @@ class Recorder:
             b = "L" if button == pmouse.Button.left else "R"
             with self._lock:
                 self._events.append((self._now(), f"{t}_{b}", x, y))
+            if button == pmouse.Button.left:
+                self._left_down = pressed
+                if not pressed:
+                    self._drag_active = False
 
     def _on_scroll(self, x, y, dx, dy):
         if self.running:
@@ -1005,12 +1021,23 @@ class Recorder:
             info = CURSORINFO()
             info.cbSize = ctypes.sizeof(info)
             last_style = None
+            prev_drag  = False
             interval   = 1.0 / 30.0
             while self.running:
                 try:
+                    # Drag just ended — _on_move emitted CURSOR_CLOSEDHAND
+                    # on the way in, so force a re-emit of whatever the OS
+                    # actually shows now (it may be unchanged from before
+                    # the drag, which would otherwise be suppressed).
+                    if prev_drag and not self._drag_active:
+                        last_style = None
+                    prev_drag = self._drag_active
+
                     if user32.GetCursorInfo(ctypes.byref(info)):
                         style = handle_to_style.get(info.hCursor, "arrow")
-                        if style != last_style:
+                        # Don't fight the synthetic drag cursor: while a
+                        # drag is active, leave the closedhand in place.
+                        if style != last_style and not self._drag_active:
                             last_style = style
                             with self._lock:
                                 self._events.append(

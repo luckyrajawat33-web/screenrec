@@ -91,16 +91,41 @@
     var frameCount = meta.frame_count || 0;
     var bundleDur  = (frameCount > 0 ? frameCount / fps : 30);
 
-    // ── Style mapping. Style Index 0 is reserved for "no cursor"; the
-    //    five sprites occupy 1–5. Cursor_Sprite.json's embedded opacity
-    //    expressions still use 0-based indices (0–4), so the importer
-    //    shifts them by +1 when wiring up the AE opacity expressions.
-    var STYLE_TO_INDEX = {
-        "arrow":      1,
-        "text":       2,
-        "pointer":    3,
-        "openhand":   4,
-        "closedhand": 5
+    // ── Real-time → comp-time remap ─────────────────────────────
+    // The recorder decimates frames to hit the target fps and stores
+    // each kept frame's true capture time in meta.frame_times. raw.mkv
+    // plays back at a constant fps, so frame N shows at N/fps in the
+    // comp even though its pixels were captured at frame_times[N].
+    // Event timestamps are real seconds; without this remap the cursor
+    // starts aligned and drifts as the clip goes on. remapTime() walks
+    // frame_times to convert a real event time into the comp playback
+    // time of the frame it belongs on.
+    var frameTimes = meta.frame_times || null;
+    function remapTime(t) {
+        if (!frameTimes || frameTimes.length < 2) return t;
+        var n = frameTimes.length;
+        if (t <= frameTimes[0])     return 0;
+        if (t >= frameTimes[n - 1]) return (n - 1) / fps;
+        var lo = 0, hi = n - 1;
+        while (hi - lo > 1) {
+            var mid = (lo + hi) >> 1;
+            if (frameTimes[mid] <= t) lo = mid; else hi = mid;
+        }
+        var span = frameTimes[hi] - frameTimes[lo];
+        var frac = span > 0 ? (t - frameTimes[lo]) / span : 0;
+        return (lo + frac) / fps;
+    }
+
+    // ── Style mapping. The recorder emits CURSOR_<NAME> events; this
+    //    table maps each NAME to the JSON cursor's 0-based index. The
+    //    AE-side Style Index then uses 1 = Hidden and 2..N+1 for the
+    //    cursors (see the dynamic cursorDefs build below).
+    var PYTHON_STYLE_TO_JSONIDX = {
+        "arrow":      0,
+        "text":       1,
+        "pointer":    2,
+        "openhand":   3,
+        "closedhand": 4
     };
 
     // ── Lottie → AE shape-layer builder ─────────────────────────
@@ -279,7 +304,10 @@
             if (em.type === "MOVE") {
                 lastX = (em.x - lft) * coordSX;
                 lastY = (em.y - topY) * coordSY;
-                pTimes.push(em.t);
+                // Remap real event time onto the footage's constant-fps
+                // playback timeline so the cursor stays glued to the
+                // recording instead of drifting late in the clip.
+                pTimes.push(remapTime(em.t));
                 pVals.push([lastX, lastY]);
             }
         }
@@ -289,60 +317,116 @@
         }
         screenPosProp.setValuesAtTimes(pTimes, pVals);
 
-        // ── Style Driver null. Holds Style Index (hold-keyed from
-        //    CURSOR_<style> events) plus Cursor Size and Cursor
-        //    Smoothness — these belong with the cursor sprites, not in
-        //    the main comp's Controls null.
+        // ── Cursor definitions from Cursor_Sprite.json ───────────
+        // Parse every cursor layer, recover its 0-based index from the
+        // embedded Bodymovin opacity expression (falls back to array
+        // order), and sort. AE Style Index is then:
+        //   1        = Hidden
+        //   2 .. N+1 = the cursors, ascending JSON-index order
+        // Drop a new sprite layer into the JSON and it automatically
+        // joins the dropdown and gets built — no script edits needed.
+        var cursorDefs = [];
+        for (var li = 0; li < cursorJson.layers.length; li++) {
+            var L = cursorJson.layers[li];
+            var ox = L.ks && L.ks.o && L.ks.o.x ? L.ks.o.x : "";
+            var m = ox.match(new RegExp("===\\s*(\\d+)"));
+            var jsonIdx = m ? parseInt(m[1], 10) : li;
+            cursorDefs.push({
+                jsonIdx: jsonIdx,
+                name: L.nm || ("Cursor " + jsonIdx),
+                layer: L
+            });
+        }
+        cursorDefs.sort(function (a, b) { return a.jsonIdx - b.jsonIdx; });
+        var dropdownItems  = ["Hidden"];
+        var jsonIdxToAeIdx = {};
+        for (var cd = 0; cd < cursorDefs.length; cd++) {
+            cursorDefs[cd].aeIdx = cd + 2;          // 1 = Hidden
+            dropdownItems.push(cursorDefs[cd].name);
+            jsonIdxToAeIdx[cursorDefs[cd].jsonIdx] = cursorDefs[cd].aeIdx;
+        }
+        var firstCursorIdx = cursorDefs.length ? cursorDefs[0].aeIdx : 1;
+
+        // ── Style Driver null ────────────────────────────────────
+        // "Recorded Style" carries the hold-keyed track baked from the
+        // recorder's CURSOR_<style> events; "Cursor Style" is a manual
+        // dropdown; "Auto Cursor" picks between them. Cursor Size and
+        // Cursor Smoothness round out the cursor knobs.
         var styleLayer = recComp.layers.addNull(duration);
         styleLayer.name = "Style Driver";
         styleLayer.guideLayer = true;
         styleLayer.enabled = false;
-        // Add all three sliders FIRST, then re-acquire fresh property
-        // references before doing anything (keyframe writes especially)
-        // — keeping a Property handle across subsequent addProperty()
-        // calls invalidates it in some AE versions and surfaces as
-        // "ReferenceError: Object is invalid" on the first setValue.
-        styleLayer.Effects.addProperty("ADBE Slider Control").name = "Style Index";
+        // Add every effect FIRST, then re-acquire fresh references —
+        // holding a Property handle across later addProperty() calls
+        // invalidates it in some AE versions ("Object is invalid").
+        styleLayer.Effects.addProperty("ADBE Checkbox Control").name = "Auto Cursor";
+        var hasDropdown = true;
+        try {
+            styleLayer.Effects.addProperty("ADBE Dropdown Control").name = "Cursor Style";
+        } catch (eDrop) {
+            // Pre-2020 AE has no Dropdown Menu Control — fall back to a
+            // plain slider for the manual picker.
+            hasDropdown = false;
+            styleLayer.Effects.addProperty("ADBE Slider Control").name = "Cursor Style";
+        }
+        styleLayer.Effects.addProperty("ADBE Slider Control").name = "Recorded Style";
         styleLayer.Effects.addProperty("ADBE Slider Control").name = "Cursor Size";
         styleLayer.Effects.addProperty("ADBE Slider Control").name = "Cursor Smoothness";
+
+        styleLayer.Effects.property("Auto Cursor").property(1).setValue(1);
         styleLayer.Effects.property("Cursor Size").property(1).setValue(200);
         styleLayer.Effects.property("Cursor Smoothness").property(1).setValue(0);
-        var styleProp = styleLayer.Effects.property("Style Index").property(1);
 
+        // Manual cursor picker: dropdown items "Hidden" + cursor names.
+        if (hasDropdown) {
+            try {
+                styleLayer.Effects.property("Cursor Style").property(1)
+                    .setPropertyParameters(dropdownItems);
+            } catch (eParams) {
+                hasDropdown = false;   // setPropertyParameters unsupported
+            }
+        }
+        styleLayer.Effects.property("Cursor Style").property(1)
+            .setValue(firstCursorIdx);
+        if (!hasDropdown) {
+            // Slider fallback — snap to whole numbers.
+            styleLayer.Effects.property("Cursor Style").property(1)
+                .expression = "Math.round(value);";
+        }
+
+        // Recorded Style: hold-keyed from CURSOR_<style> events, times
+        // remapped through frame_times so it stays glued to the footage.
         var styleTimes = [];
         var styleVals  = [];
         for (var ei = 0; ei < events.length; ei++) {
             var ev = events[ei];
             if (ev.type && ev.type.indexOf("CURSOR_") === 0) {
                 var nm = ev.type.substring("CURSOR_".length).toLowerCase();
-                if (STYLE_TO_INDEX.hasOwnProperty(nm)) {
-                    styleTimes.push(ev.t);
-                    styleVals.push(STYLE_TO_INDEX[nm]);
+                if (PYTHON_STYLE_TO_JSONIDX.hasOwnProperty(nm)) {
+                    var jIdx = PYTHON_STYLE_TO_JSONIDX[nm];
+                    if (jsonIdxToAeIdx.hasOwnProperty(jIdx)) {
+                        styleTimes.push(remapTime(ev.t));
+                        styleVals.push(jsonIdxToAeIdx[jIdx]);
+                    }
                 }
             }
         }
         if (styleTimes.length === 0) {
             // No CURSOR_<style> samples (e.g. non-Windows recording) —
-            // fall back to the plain arrow (index 1) so something shows.
+            // pin to the first cursor so something shows.
             styleTimes = [0];
-            styleVals  = [1];
+            styleVals  = [firstCursorIdx];
         }
-        styleProp.setValuesAtTimes(styleTimes, styleVals);
-        for (var ki = 1; ki <= styleProp.numKeys; ki++) {
-            styleProp.setInterpolationTypeAtKey(
+        var recStyleProp = styleLayer.Effects.property("Recorded Style").property(1);
+        recStyleProp.setValuesAtTimes(styleTimes, styleVals);
+        for (var ki = 1; ki <= recStyleProp.numKeys; ki++) {
+            recStyleProp.setInterpolationTypeAtKey(
                 ki,
                 KeyframeInterpolationType.HOLD,
                 KeyframeInterpolationType.HOLD);
         }
-        // Snap the slider to whole numbers. Keyframe values are already
-        // integers; this also forces any value the user types/drags to
-        // the nearest level (0 = hidden, 1–5 = the five sprites), so the
-        // Effect Controls panel never shows 0.5 / 2.8 etc.
-        styleProp.expression = "Math.round(value);";
 
-        // ── Cursor Position Null (parent for the cursor shapes) ──
-        //    Position, Size, and Smoothness all read from Style Driver
-        //    in this same precomp — no cross-comp reference needed.
+        // ── Cursor Position Null ─────────────────────────────────
         var cursorNull = recComp.layers.addNull(duration);
         cursorNull.name = "Cursor Position Null";
         cursorNull.transform.anchorPoint.setValue([0, 0]);
@@ -357,47 +441,28 @@
             '    p = [raw[0]*(1-smo) + sm[0]*smo, raw[1]*(1-smo) + sm[1]*smo];\n' +
             '}\n' +
             'p;';
-        // Scale is left at default; the cursors expression-link their
-        // Position to this null but compute Scale from Cursor Size on
-        // Style Driver directly. This avoids a chained dependency and
-        // keeps the null purely as a position anchor.
 
-        // ── 5 cursor shape layers from Cursor_Sprite.json ────────
-        // Lottie file lists them top-to-bottom in this order:
-        //   Closedhand (idx 4), Openhand (idx 3), Pointinghand (idx 2),
-        //   textcursor (idx 1), Arrow (idx 0).
-        // We add the lowest-index last so Arrow ends up at the top of the
-        // layer stack (visually first in the timeline).
+        // ── Cursor shape layers ──────────────────────────────────
+        // Effective Style Index = Auto Cursor ? Recorded Style track :
+        // manual Cursor Style picker. Each cursor shows when the
+        // rounded effective index equals its aeIdx.
+        var styleSelExpr =
+            'var d = thisComp.layer("Style Driver");\n' +
+            'var auto = d.effect("Auto Cursor")("Checkbox");\n' +
+            'var idx = auto > 0.5\n' +
+            '    ? d.effect("Recorded Style")("Slider")\n' +
+            '    : d.effect("Cursor Style")(' +
+                (hasDropdown ? '"Menu"' : '"Slider"') + ');\n';
+        // Build in reverse aeIdx order so the lowest index (first
+        // cursor) ends up on top of the layer stack.
         var cursorLayers = [];
-        // First, gather Lottie layers by index from STYLE_TO_INDEX so we
-        // don't rely on the file's array order.
-        var byIndex = {};
-        for (var li = 0; li < cursorJson.layers.length; li++) {
-            var L = cursorJson.layers[li];
-            // The bodymovin opacity expression encodes the index, e.g.
-            // "...Math.round(s) === 4 ? 100 : 0...". Parse it back so the
-            // mapping survives reorderings of the file.
-            var ox = L.ks && L.ks.o && L.ks.o.x ? L.ks.o.x : "";
-            // Pull the index out of the embedded Bodymovin opacity expr
-            // (e.g. "Math.round(s) === 4 ? 100 : 0"). RegExp() avoids the
-            // ExtendScript parser confusing "/===" with the /= operator.
-            var m = ox.match(new RegExp("===\\s*(\\d+)"));
-            var idx = m ? parseInt(m[1], 10) : null;
-            if (idx !== null && idx >= 0 && idx <= 4) {
-                byIndex[idx] = L;
-            }
-        }
-        // Add in reverse so the arrow ends up on top. The JSON encodes
-        // 0-based indices (0–4); Style Index uses 1–5 with 0 = hidden,
-        // so the opacity expression checks idx + 1.
-        for (var idx = 4; idx >= 0; idx--) {
-            var lLayer = byIndex[idx];
-            if (!lLayer) continue;
-            var aeIdx = idx + 1;
+        for (var ci2 = cursorDefs.length - 1; ci2 >= 0; ci2--) {
+            var cdef = cursorDefs[ci2];
             var opacityExpr =
-                'var s = thisComp.layer("Style Driver").effect("Style Index")("Slider");\n' +
-                'Math.round(s) === ' + aeIdx + ' ? 100 : 0;';
-            var aeLyr = buildCursorLayer(recComp, lLayer, opacityExpr, cursorNull);
+                styleSelExpr +
+                'Math.round(idx) === ' + cdef.aeIdx + ' ? 100 : 0;';
+            var aeLyr = buildCursorLayer(
+                recComp, cdef.layer, opacityExpr, cursorNull);
             cursorLayers.push(aeLyr);
         }
 
@@ -443,6 +508,7 @@
         addSlider("Roundness",       14);
         addSlider("Shadow",          70);
         addSlider("Glass Halo",      14);
+        addSlider("Halo Opacity",    14);
         addSlider("Zoom Level",      1.0);
         addPoint ("Zoom Position",   [0.5, 0.5]);
         addColor ("BG Color A", [0.10, 0.16, 0.36]);
@@ -479,41 +545,14 @@
         ramp.property("End Color").expression =
             thisCompCtrl("BG Color B", "Color") + ';';
 
-        // ── Glass Halo (soft white plate under the recording) ────
-        // Size = recording FIT size (zoom-independent) + halo on every
-        // edge; position is the fixed comp centre. The halo never
-        // reacts to Zoom Level or Zoom Position — only the footage
-        // precomp zooms.
-        var glass = masterComp.layers.addShape();
-        glass.name = "Glass Halo";
-        var glassRoot = glass.property("ADBE Root Vectors Group");
-        var glassGrp  = glassRoot.addProperty("ADBE Vector Group");
-        glassGrp.name = "Halo";
-        var glassContents = glassGrp.property("ADBE Vectors Group");
-        var glassRect = glassContents.addProperty("ADBE Vector Shape - Rect");
-        glassRect.property("Size").expression =
-            FIT_SIZE_EXPR +
-            'var halo = ' + thisCompCtrl("Glass Halo", "Slider") + ';\n' +
-            '[srcW * fit + halo*2, srcH * fit + halo*2];';
-        glassRect.property("Roundness").expression =
-            'var r    = ' + thisCompCtrl("Roundness", "Slider") + ';\n' +
-            'var halo = ' + thisCompCtrl("Glass Halo", "Slider") + ';\n' +
-            'r + halo;';
-        var glassFill = glassContents.addProperty("ADBE Vector Graphic - Fill");
-        glassFill.property("Color").setValue([1, 1, 1]);
-        glassFill.property("Opacity").setValue(14);
-        glass.transform.position.setValue([canvasW / 2, canvasH / 2]);
-        glass.transform.opacity.expression =
-            'var halo = ' + thisCompCtrl("Glass Halo", "Slider") + ';\n' +
-            'halo > 0 ? 100 : 0;';
-
         // ── Recording Shadow (cast behind the recording) ─────────
-        // A rounded rectangle the exact size of the matte. The Drop
-        // Shadow effect runs in Shadow-Only mode with Distance 0, so
-        // the shadow sits dead-centre behind the recording and only
-        // its blurred edge peeks out past the matte. The Shadow slider
-        // drives Softness alone — a real, visible shadow that the
-        // alpha matte can't clip (because this layer isn't matted).
+        // Created BEFORE the Glass Halo so it ends up *below* the halo
+        // in the layer stack. A rounded rectangle the exact size of the
+        // matte; the Drop Shadow runs Shadow-Only with Distance 0, so
+        // the shadow sits dead-centre behind the recording and only its
+        // blurred edge peeks past the matte. The Shadow slider drives
+        // Softness alone — a real, visible shadow the alpha matte can't
+        // clip (this layer isn't matted).
         var shadowLyr = masterComp.layers.addShape();
         shadowLyr.name = "Recording Shadow";
         var shRoot = shadowLyr.property("ADBE Root Vectors Group");
@@ -538,6 +577,35 @@
         // "Shadow Only" so the black plate itself never renders — only
         // its shadow does.
         sds.property("Shadow Only").setValue(1);
+
+        // ── Glass Halo (soft white plate under the recording) ────
+        // Created AFTER the shadow so it sits above it. Size = recording
+        // FIT size (zoom-independent) + halo on every edge; position is
+        // the fixed comp centre. Never reacts to Zoom Level / Position.
+        // Fill opacity is driven by the "Halo Opacity" slider.
+        var glass = masterComp.layers.addShape();
+        glass.name = "Glass Halo";
+        var glassRoot = glass.property("ADBE Root Vectors Group");
+        var glassGrp  = glassRoot.addProperty("ADBE Vector Group");
+        glassGrp.name = "Halo";
+        var glassContents = glassGrp.property("ADBE Vectors Group");
+        var glassRect = glassContents.addProperty("ADBE Vector Shape - Rect");
+        glassRect.property("Size").expression =
+            FIT_SIZE_EXPR +
+            'var halo = ' + thisCompCtrl("Glass Halo", "Slider") + ';\n' +
+            '[srcW * fit + halo*2, srcH * fit + halo*2];';
+        glassRect.property("Roundness").expression =
+            'var r    = ' + thisCompCtrl("Roundness", "Slider") + ';\n' +
+            'var halo = ' + thisCompCtrl("Glass Halo", "Slider") + ';\n' +
+            'r + halo;';
+        var glassFill = glassContents.addProperty("ADBE Vector Graphic - Fill");
+        glassFill.property("Color").setValue([1, 1, 1]);
+        glassFill.property("Opacity").expression =
+            thisCompCtrl("Halo Opacity", "Slider") + ';';
+        glass.transform.position.setValue([canvasW / 2, canvasH / 2]);
+        glass.transform.opacity.expression =
+            'var halo = ' + thisCompCtrl("Glass Halo", "Slider") + ';\n' +
+            'halo > 0 ? 100 : 0;';
 
         // ── Recording (precomp instance) ─────────────────────────
         var rec = masterComp.layers.add(recComp);
@@ -612,11 +680,15 @@
         alert("Imported " + bundle.name + "\n" +
               "  duration: " + duration.toFixed(2) + " s\n" +
               "  cursor samples: " + styleTimes.length + "\n" +
-              "  move events: " + pTimes.length + "\n\n" +
+              "  move events: " + pTimes.length + "\n" +
+              "  cursor sprites: " + cursorDefs.length +
+              (hasDropdown ? " (dropdown picker)" : " (slider picker)") + "\n\n" +
               "Main comp 'Controls': Padding, Roundness, Shadow, Glass Halo,\n" +
-              "Zoom Level (1.0 = no zoom), Zoom Position ([0.5, 0.5] = centred),\n" +
-              "BG Color A / B.\n" +
-              "Recording precomp 'Style Driver': Style Index, Cursor Size, Cursor Smoothness.");
+              "Halo Opacity, Zoom Level (1.0 = no zoom), Zoom Position\n" +
+              "([0.5, 0.5] = centred), BG Color A / B.\n" +
+              "Recording precomp 'Style Driver': Auto Cursor (on = follow the\n" +
+              "recorded cursor), Cursor Style (manual picker), Recorded Style,\n" +
+              "Cursor Size, Cursor Smoothness.");
     } catch (err) {
         var detail = "Import failed: " + err.toString();
         if (typeof err.line !== "undefined" && err.line !== null) {
