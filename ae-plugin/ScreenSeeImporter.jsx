@@ -91,15 +91,16 @@
     var frameCount = meta.frame_count || 0;
     var bundleDur  = (frameCount > 0 ? frameCount / fps : 30);
 
-    // ── Style mapping. Indices below match Cursor_Sprite.json's
-    //    embedded opacity expressions and the layer order described in
-    //    the file header.
+    // ── Style mapping. Style Index 0 is reserved for "no cursor"; the
+    //    five sprites occupy 1–5. Cursor_Sprite.json's embedded opacity
+    //    expressions still use 0-based indices (0–4), so the importer
+    //    shifts them by +1 when wiring up the AE opacity expressions.
     var STYLE_TO_INDEX = {
-        "arrow":      0,
-        "text":       1,
-        "pointer":    2,
-        "openhand":   3,
-        "closedhand": 4
+        "arrow":      1,
+        "text":       2,
+        "pointer":    3,
+        "openhand":   4,
+        "closedhand": 5
     };
 
     // ── Lottie → AE shape-layer builder ─────────────────────────
@@ -311,8 +312,10 @@
             }
         }
         if (styleTimes.length === 0) {
+            // No CURSOR_<style> samples (e.g. non-Windows recording) —
+            // fall back to the plain arrow (index 1) so something shows.
             styleTimes = [0];
-            styleVals  = [0];
+            styleVals  = [1];
         }
         styleProp.setValuesAtTimes(styleTimes, styleVals);
         for (var ki = 1; ki <= styleProp.numKeys; ki++) {
@@ -321,6 +324,11 @@
                 KeyframeInterpolationType.HOLD,
                 KeyframeInterpolationType.HOLD);
         }
+        // Snap the slider to whole numbers. Keyframe values are already
+        // integers; this also forces any value the user types/drags to
+        // the nearest level (0 = hidden, 1–5 = the five sprites), so the
+        // Effect Controls panel never shows 0.5 / 2.8 etc.
+        styleProp.expression = "Math.round(value);";
 
         // ── Cursor Position Null (parent for the cursor shapes) ──
         //    Position, Size, and Smoothness all read from Style Driver
@@ -369,13 +377,16 @@
                 byIndex[idx] = L;
             }
         }
-        // Add in reverse so index 0 (Arrow) ends up on top.
+        // Add in reverse so the arrow ends up on top. The JSON encodes
+        // 0-based indices (0–4); Style Index uses 1–5 with 0 = hidden,
+        // so the opacity expression checks idx + 1.
         for (var idx = 4; idx >= 0; idx--) {
             var lLayer = byIndex[idx];
             if (!lLayer) continue;
+            var aeIdx = idx + 1;
             var opacityExpr =
                 'var s = thisComp.layer("Style Driver").effect("Style Index")("Slider");\n' +
-                'Math.round(s) === ' + idx + ' ? 100 : 0;';
+                'Math.round(s) === ' + aeIdx + ' ? 100 : 0;';
             var aeLyr = buildCursorLayer(recComp, lLayer, opacityExpr, cursorNull);
             cursorLayers.push(aeLyr);
         }
@@ -426,6 +437,12 @@
         addPoint ("Zoom Position",   [0.5, 0.5]);
         addColor ("BG Color A", [0.10, 0.16, 0.36]);
         addColor ("BG Color B", [0.55, 0.32, 0.85]);
+        // Keep Zoom Level inside 1.0–2.0 at the slider itself, so the
+        // Effect Controls panel reflects the clamp the moment the user
+        // overshoots (the Recording scale expression also clamps, but
+        // this gives immediate visual feedback).
+        fx.property("Zoom Level").property(1).expression =
+            "Math.max(1, Math.min(2, value));";
 
         // ── Background (solid + Ramp + blur) ────────────────────
         var bg = masterComp.layers.addSolid(
@@ -439,6 +456,9 @@
             thisCompCtrl("BG Color B", "Color") + ';';
 
         // ── Glass Halo (soft white plate under the recording) ────
+        // Size + position track the Recording layer directly so the
+        // halo always matches the recording's aspect ratio and follows
+        // it when Padding (and therefore the fit scale) changes.
         var glass = masterComp.layers.addShape();
         glass.name = "Glass Halo";
         var glassRoot = glass.property("ADBE Root Vectors Group");
@@ -447,9 +467,10 @@
         var glassContents = glassGrp.property("ADBE Vectors Group");
         var glassRect = glassContents.addProperty("ADBE Vector Shape - Rect");
         glassRect.property("Size").expression =
-            'var pad  = ' + thisCompCtrl("Padding", "Slider") + ';\n' +
+            'var rec  = thisComp.layer("Recording");\n' +
+            'var s    = rec.transform.scale[0] / 100;\n' +
             'var halo = ' + thisCompCtrl("Glass Halo", "Slider") + ';\n' +
-            '[thisComp.width - pad*2 + halo*2, thisComp.height - pad*2 + halo*2];';
+            '[rec.source.width * s + halo*2, rec.source.height * s + halo*2];';
         glassRect.property("Roundness").expression =
             'var r    = ' + thisCompCtrl("Roundness", "Slider") + ';\n' +
             'var halo = ' + thisCompCtrl("Glass Halo", "Slider") + ';\n' +
@@ -457,7 +478,8 @@
         var glassFill = glassContents.addProperty("ADBE Vector Graphic - Fill");
         glassFill.property("Color").setValue([1, 1, 1]);
         glassFill.property("Opacity").setValue(14);
-        glass.transform.position.setValue([canvasW / 2, canvasH / 2]);
+        glass.transform.position.expression =
+            'thisComp.layer("Recording").transform.position;';
         glass.transform.opacity.expression =
             'var halo = ' + thisCompCtrl("Glass Halo", "Slider") + ';\n' +
             'halo > 0 ? 100 : 0;';
@@ -472,9 +494,12 @@
         // letterboxed instead of cover-cropped. Zoom Level is a plain
         // multiplier — at 1.0 the recording fits exactly, above 1.0 it
         // zooms in and the matte clips the overflow.
+        // Zoom Level is clamped to 1.0–2.0 here so the slider can't push
+        // the recording past a useful range no matter what value the
+        // user types or drags in.
         rec.transform.scale.expression =
             'var pad = ' + thisCompCtrl("Padding", "Slider") + ';\n' +
-            'var z   = ' + thisCompCtrl("Zoom Level", "Slider") + ';\n' +
+            'var z   = Math.max(1, Math.min(2, ' + thisCompCtrl("Zoom Level", "Slider") + '));\n' +
             'var srcW   = thisLayer.source.width;\n' +
             'var srcH   = thisLayer.source.height;\n' +
             'var frameW = thisComp.width  - pad*2;\n' +
@@ -482,10 +507,12 @@
             'var fit    = Math.min(frameW / srcW, frameH / srcH) * 100;\n' +
             '[fit * z, fit * z];';
         // Position: pan range is the overflow of the zoomed recording
-        // past the matte edge — max(0, scaledSize - frame). At Zoom
-        // Level 1 the overflow is 0 so the slider has no effect; at >1
-        // a Zoom Position of [0, 0] pulls the source's top-left into
-        // view and [1, 1] its bottom-right. [0.5, 0.5] = centred.
+        // past the matte edge — max(0, scaledSize - frame). Zoom
+        // Position is clamped to 0–1, so the recording edge can never
+        // pull inside the matte: 0 = source edge flush to matte edge,
+        // 0.5 = centred, 1 = opposite edge flush. Anything outside that
+        // range is clipped, so a stray 1.4 or -0.3 just sticks at the
+        // boundary instead of exposing empty matte.
         rec.transform.position.expression =
             'var pad = ' + thisCompCtrl("Padding", "Slider") + ';\n' +
             'var zp  = ' + thisCompCtrl("Zoom Position", "Point") + ';\n' +
@@ -496,8 +523,10 @@
             'var frameH = thisComp.height - pad*2;\n' +
             'var panW = Math.max(0, srcW * s - frameW);\n' +
             'var panH = Math.max(0, srcH * s - frameH);\n' +
-            '[thisComp.width/2  - (zp[0] - 0.5) * panW,\n' +
-            ' thisComp.height/2 - (zp[1] - 0.5) * panH];';
+            'var zx = Math.max(0, Math.min(1, zp[0]));\n' +
+            'var zy = Math.max(0, Math.min(1, zp[1]));\n' +
+            '[thisComp.width/2  - (zx - 0.5) * panW,\n' +
+            ' thisComp.height/2 - (zy - 0.5) * panH];';
         var ds = rec.Effects.addProperty("ADBE Drop Shadow");
         ds.property("Opacity").expression =
             'Math.min(255, ' + thisCompCtrl("Shadow", "Slider") + ' * 2.5);';
