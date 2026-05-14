@@ -362,16 +362,22 @@
         styleLayer.Effects.addProperty("ADBE Checkbox Control").name = "Auto Cursor";
         var hasDropdown = true;
         try {
-            styleLayer.Effects.addProperty("ADBE Dropdown Control").name = "Cursor Style";
+            styleLayer.Effects.addProperty("ADBE Dropdown Control");
         } catch (eDrop) {
             // Pre-2020 AE has no Dropdown Menu Control — fall back to a
             // plain slider for the manual picker.
             hasDropdown = false;
-            styleLayer.Effects.addProperty("ADBE Slider Control").name = "Cursor Style";
+            styleLayer.Effects.addProperty("ADBE Slider Control");
         }
         styleLayer.Effects.addProperty("ADBE Slider Control").name = "Recorded Style";
         styleLayer.Effects.addProperty("ADBE Slider Control").name = "Cursor Size";
         styleLayer.Effects.addProperty("ADBE Slider Control").name = "Cursor Smoothness";
+
+        // The manual cursor picker is the 2nd effect added. A freshly
+        // added Dropdown Menu Control cannot be renamed until its menu
+        // items are set, so address it by index ("Cursor Style" lookups
+        // would return null) and rename it once it's initialised.
+        var styleFxIdx = 2;
 
         styleLayer.Effects.property("Auto Cursor").property(1).setValue(1);
         styleLayer.Effects.property("Cursor Size").property(1).setValue(200);
@@ -380,15 +386,14 @@
         // Manual cursor picker: dropdown items "Hidden" + cursor names.
         if (hasDropdown) {
             try {
-                styleLayer.Effects.property("Cursor Style").property(1)
+                styleLayer.Effects.property(styleFxIdx).property(1)
                     .setPropertyParameters(dropdownItems);
-                // setPropertyParameters deletes and recreates the dropdown
-                // effect, which resets its name back to the AE default.
-                // Find the recreated dropdown by match name and rename it.
+                // setPropertyParameters may delete and recreate the
+                // effect, changing its index — re-locate it by match name.
                 for (var fx = 1; fx <= styleLayer.Effects.numProperties; fx++) {
-                    var fxProp = styleLayer.Effects.property(fx);
-                    if (fxProp.matchName === "ADBE Dropdown Control") {
-                        fxProp.name = "Cursor Style";
+                    if (styleLayer.Effects.property(fx).matchName
+                            === "ADBE Dropdown Control") {
+                        styleFxIdx = fx;
                         break;
                     }
                 }
@@ -396,11 +401,12 @@
                 hasDropdown = false;   // setPropertyParameters unsupported
             }
         }
-        styleLayer.Effects.property("Cursor Style").property(1)
+        styleLayer.Effects.property(styleFxIdx).name = "Cursor Style";
+        styleLayer.Effects.property(styleFxIdx).property(1)
             .setValue(firstCursorIdx);
         if (!hasDropdown) {
             // Slider fallback — snap to whole numbers.
-            styleLayer.Effects.property("Cursor Style").property(1)
+            styleLayer.Effects.property(styleFxIdx).property(1)
                 .expression = "Math.round(value);";
         }
 
