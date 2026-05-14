@@ -592,10 +592,13 @@ The app keeps essentially nothing in RAM:
 
 ## 14. Known gaps / future work
 
-- **Real OS cursor capture** — what would let us show I-beam over
-  text, hand over links, etc. Needs Win32 `GetCursorInfo` polled on
-  a background thread, a `(HICON → PIL sprite)` cache, and a
-  cursor-state track in the bundle. Sizable but well-scoped.
+- **Real OS cursor capture** — *done* (Windows). `_start_cursor_sampler`
+  polls the live cursor at ~30 Hz, fingerprints it by appearance
+  (render to a 32×32 box → coarse 8×8 opacity silhouette, so it's
+  stable across display-DPI scaling and private cursor copies), and
+  emits `CURSOR_<style>` events. Remaining work: macOS/Linux
+  equivalents, and richer sprites for resize/wait/cross cursors that
+  currently fall back to the arrow.
 - **GPU compositor** — PIL is the perf floor right now. A
   `moderngl` or `pyglet` shader pass for chrome + paste would
   unlock 4K previews. Big refactor.

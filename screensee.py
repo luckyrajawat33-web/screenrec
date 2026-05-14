@@ -927,6 +927,7 @@ class Recorder:
         self._cur_thread = None         # OS cursor-type sampler thread
         self._left_down  = False        # left mouse button currently held
         self._drag_active = False       # a held-button drag is in progress
+        self._press_xy   = (0, 0)       # screen pos of the last left press
 
     def _now(self):
         return time.perf_counter() - self._t0
@@ -936,16 +937,21 @@ class Recorder:
         if self.running:
             with self._lock:
                 self._events.append((self._now(), "MOVE", x, y))
-            # A move while the left button is held is a drag. Emit a
-            # one-shot CURSOR_CLOSEDHAND so the editor can swap to the
-            # grab cursor — the OS rarely exposes a "dragging" cursor
-            # handle of its own. The cursor sampler re-emits the real
-            # OS style when the drag ends (see _start_cursor_sampler).
+            # A held-button move is a drag — but only once the pointer
+            # has travelled past a small threshold. Without it the tiny
+            # jitter during an ordinary click trips the drag and flickers
+            # the grab cursor "for no reason". Emit a one-shot
+            # CURSOR_CLOSEDHAND so the editor can swap to the grab cursor
+            # (the OS rarely exposes a "dragging" cursor of its own); the
+            # cursor sampler re-emits the real OS style when the drag
+            # ends (see _start_cursor_sampler).
             if self._left_down and not self._drag_active:
-                self._drag_active = True
-                with self._lock:
-                    self._events.append(
-                        (self._now(), "CURSOR_CLOSEDHAND", x, y))
+                px, py = self._press_xy
+                if abs(x - px) + abs(y - py) >= 6:
+                    self._drag_active = True
+                    with self._lock:
+                        self._events.append(
+                            (self._now(), "CURSOR_CLOSEDHAND", x, y))
 
     def _on_click(self, x, y, button, pressed):
         if self.running:
@@ -955,7 +961,9 @@ class Recorder:
                 self._events.append((self._now(), f"{t}_{b}", x, y))
             if button == pmouse.Button.left:
                 self._left_down = pressed
-                if not pressed:
+                if pressed:
+                    self._press_xy = (x, y)
+                else:
                     self._drag_active = False
 
     def _on_scroll(self, x, y, dx, dy):
@@ -982,10 +990,18 @@ class Recorder:
             self.running = False
 
     # ── OS cursor-type sampler ─────────────────────────────────
-    # Polls GetCursorInfo at ~30 Hz on Windows and emits a "CURSOR_<style>"
-    # event whenever the active cursor handle changes. Matched against the
-    # standard IDC_* handles loaded once at thread start. No-op on
-    # non-Windows; recordings simply fall back to the user-picked style.
+    # Polls the live OS cursor at ~30 Hz on Windows and emits a
+    # "CURSOR_<style>" event whenever its shape changes — so the editor
+    # can mirror the contextual cursor the user actually saw (I-beam over
+    # text, hand over a link, four-arrow move, ...).
+    #
+    # Cursors are identified by *appearance*, not handle: GetCursorInfo's
+    # hCursor is not stable across display-DPI scaling, and apps often
+    # use private copies of the standard cursors, so direct handle
+    # matching against LoadCursorW() almost always collapsed to "arrow".
+    # Instead we render each cursor into a fixed 32x32 box and reduce it
+    # to a coarse 8x8 opacity silhouette; that fingerprint is stable
+    # across DPI scaling and cursor colour-depth. No-op on non-Windows.
     def _start_cursor_sampler(self):
         if not IS_WINDOWS:
             return
@@ -996,6 +1012,7 @@ class Recorder:
             return
 
         user32 = ctypes.windll.user32
+        gdi32  = ctypes.windll.gdi32
 
         class POINT(ctypes.Structure):
             _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
@@ -1006,16 +1023,107 @@ class Recorder:
                         ("hCursor",      ctypes.c_void_p),
                         ("ptScreenPos",  POINT)]
 
-        user32.LoadCursorW.restype  = ctypes.c_void_p
-        user32.LoadCursorW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        class BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [("biSize",          wintypes.DWORD),
+                        ("biWidth",         ctypes.c_long),
+                        ("biHeight",        ctypes.c_long),
+                        ("biPlanes",        wintypes.WORD),
+                        ("biBitCount",      wintypes.WORD),
+                        ("biCompression",   wintypes.DWORD),
+                        ("biSizeImage",     wintypes.DWORD),
+                        ("biXPelsPerMeter", ctypes.c_long),
+                        ("biYPelsPerMeter", ctypes.c_long),
+                        ("biClrUsed",       wintypes.DWORD),
+                        ("biClrImportant",  wintypes.DWORD)]
+
         user32.GetCursorInfo.argtypes = [ctypes.POINTER(CURSORINFO)]
         user32.GetCursorInfo.restype  = wintypes.BOOL
+        user32.LoadCursorW.argtypes   = [ctypes.c_void_p, ctypes.c_void_p]
+        user32.LoadCursorW.restype    = ctypes.c_void_p
+        user32.GetDC.argtypes         = [ctypes.c_void_p]
+        user32.GetDC.restype          = ctypes.c_void_p
+        user32.ReleaseDC.argtypes     = [ctypes.c_void_p, ctypes.c_void_p]
+        user32.DrawIconEx.argtypes    = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, wintypes.UINT, ctypes.c_void_p,
+            wintypes.UINT]
+        user32.DrawIconEx.restype     = wintypes.BOOL
+        gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+        gdi32.CreateCompatibleDC.restype  = ctypes.c_void_p
+        gdi32.CreateDIBSection.argtypes   = [
+            ctypes.c_void_p, ctypes.c_void_p, wintypes.UINT,
+            ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, wintypes.DWORD]
+        gdi32.CreateDIBSection.restype    = ctypes.c_void_p
+        gdi32.SelectObject.argtypes       = [ctypes.c_void_p, ctypes.c_void_p]
+        gdi32.SelectObject.restype        = ctypes.c_void_p
+        gdi32.DeleteObject.argtypes       = [ctypes.c_void_p]
+        gdi32.DeleteDC.argtypes           = [ctypes.c_void_p]
 
-        handle_to_style = {}
+        DI_NORMAL = 0x0003
+        BOX       = 32                       # render every cursor into 32x32
+        nbytes    = BOX * BOX * 4
+
+        # Offscreen 32-bit top-down DIB we draw cursors into, built once.
+        screen_dc = user32.GetDC(None)
+        mem_dc    = gdi32.CreateCompatibleDC(screen_dc)
+        bmi = BITMAPINFOHEADER()
+        bmi.biSize        = ctypes.sizeof(bmi)
+        bmi.biWidth       = BOX
+        bmi.biHeight      = -BOX             # negative => top-down rows
+        bmi.biPlanes      = 1
+        bmi.biBitCount    = 32
+        bmi.biCompression = 0               # BI_RGB
+        bits_ptr = ctypes.c_void_p()
+        dib = gdi32.CreateDIBSection(mem_dc, ctypes.byref(bmi), 0,
+                                     ctypes.byref(bits_ptr), None, 0)
+        if not dib or not bits_ptr.value:
+            # Couldn't set up the offscreen surface — give up quietly;
+            # the recording just won't carry contextual cursor changes.
+            if mem_dc:    gdi32.DeleteDC(mem_dc)
+            if screen_dc: user32.ReleaseDC(None, screen_dc)
+            return
+        gdi32.SelectObject(mem_dc, dib)
+        pixbuf = (ctypes.c_char * nbytes)
+
+        def fingerprint(hcursor):
+            """Render the cursor over a black field and then a white one;
+            pixels identical on both are opaque (the cursor body), pixels
+            that differ are (semi-)transparent. Reduce that to a coarse
+            8x8 silhouette — robust to the scaling artefacts a DPI-scaled
+            cursor picks up when squeezed into the fixed box."""
+            if not hcursor:
+                return None
+            ctypes.memset(bits_ptr.value, 0x00, nbytes)
+            if not user32.DrawIconEx(mem_dc, 0, 0, hcursor, BOX, BOX,
+                                     0, None, DI_NORMAL):
+                return None
+            on_black = pixbuf.from_address(bits_ptr.value).raw
+            ctypes.memset(bits_ptr.value, 0xFF, nbytes)
+            if not user32.DrawIconEx(mem_dc, 0, 0, hcursor, BOX, BOX,
+                                     0, None, DI_NORMAL):
+                return None
+            on_white = pixbuf.from_address(bits_ptr.value).raw
+            fp     = 0
+            cell   = BOX // 8
+            thresh = cell * cell // 2
+            for gy in range(8):
+                for gx in range(8):
+                    opaque = 0
+                    for yy in range(cell):
+                        base = ((gy * cell + yy) * BOX + gx * cell) * 4
+                        for xx in range(cell):
+                            p = base + xx * 4
+                            if on_black[p:p + 3] == on_white[p:p + 3]:
+                                opaque += 1
+                    fp = (fp << 1) | (1 if opaque > thresh else 0)
+            return fp
+
+        # Reference fingerprints for the standard IDC_* cursors.
+        fp_to_style = {}
         for resid, style in _WIN_IDC_TO_STYLE.items():
-            h = user32.LoadCursorW(None, ctypes.c_void_p(resid))
-            if h:
-                handle_to_style[h] = style
+            fp = fingerprint(user32.LoadCursorW(None, ctypes.c_void_p(resid)))
+            if fp is not None:
+                fp_to_style.setdefault(fp, style)
 
         def loop():
             info = CURSORINFO()
@@ -1023,30 +1131,49 @@ class Recorder:
             last_style = None
             prev_drag  = False
             interval   = 1.0 / 30.0
-            while self.running:
-                try:
-                    # Drag just ended — _on_move emitted CURSOR_CLOSEDHAND
-                    # on the way in, so force a re-emit of whatever the OS
-                    # actually shows now (it may be unchanged from before
-                    # the drag, which would otherwise be suppressed).
-                    if prev_drag and not self._drag_active:
-                        last_style = None
-                    prev_drag = self._drag_active
+            fp_cache   = {}            # hCursor -> resolved style
+            try:
+                while self.running:
+                    try:
+                        # Drag just ended — _on_move emitted a synthetic
+                        # CURSOR_CLOSEDHAND on the way in, so force a
+                        # re-emit of whatever the OS shows now (it may be
+                        # unchanged from before the drag and would
+                        # otherwise be suppressed).
+                        if prev_drag and not self._drag_active:
+                            last_style = None
+                        prev_drag = self._drag_active
 
-                    if user32.GetCursorInfo(ctypes.byref(info)):
-                        style = handle_to_style.get(info.hCursor, "arrow")
-                        # Don't fight the synthetic drag cursor: while a
-                        # drag is active, leave the closedhand in place.
-                        if style != last_style and not self._drag_active:
-                            last_style = style
-                            with self._lock:
-                                self._events.append(
-                                    (self._now(), f"CURSOR_{style.upper()}",
-                                     int(info.ptScreenPos.x),
-                                     int(info.ptScreenPos.y)))
-                except Exception:
-                    return
-                time.sleep(interval)
+                        if user32.GetCursorInfo(ctypes.byref(info)):
+                            h = info.hCursor
+                            if h in fp_cache:
+                                style = fp_cache[h]
+                            else:
+                                style = fp_to_style.get(fingerprint(h),
+                                                        "arrow")
+                                if len(fp_cache) > 64:
+                                    fp_cache.clear()
+                                fp_cache[h] = style
+                            # Don't fight the synthetic drag cursor: while
+                            # a drag is active leave the closedhand in.
+                            if style != last_style and not self._drag_active:
+                                last_style = style
+                                with self._lock:
+                                    self._events.append(
+                                        (self._now(),
+                                         f"CURSOR_{style.upper()}",
+                                         int(info.ptScreenPos.x),
+                                         int(info.ptScreenPos.y)))
+                    except Exception:
+                        # Transient GDI hiccup — keep polling rather than
+                        # killing the thread (which would freeze cursor
+                        # detection for the rest of the recording).
+                        pass
+                    time.sleep(interval)
+            finally:
+                gdi32.DeleteObject(dib)
+                gdi32.DeleteDC(mem_dc)
+                user32.ReleaseDC(None, screen_dc)
 
         self._cur_thread = threading.Thread(target=loop, daemon=True)
         self._cur_thread.start()
