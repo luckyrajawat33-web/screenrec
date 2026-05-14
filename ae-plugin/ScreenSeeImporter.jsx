@@ -382,6 +382,16 @@
             try {
                 styleLayer.Effects.property("Cursor Style").property(1)
                     .setPropertyParameters(dropdownItems);
+                // setPropertyParameters deletes and recreates the dropdown
+                // effect, which resets its name back to the AE default.
+                // Find the recreated dropdown by match name and rename it.
+                for (var fx = 1; fx <= styleLayer.Effects.numProperties; fx++) {
+                    var fxProp = styleLayer.Effects.property(fx);
+                    if (fxProp.matchName === "ADBE Dropdown Control") {
+                        fxProp.name = "Cursor Style";
+                        break;
+                    }
+                }
             } catch (eParams) {
                 hasDropdown = false;   // setPropertyParameters unsupported
             }
