@@ -18,9 +18,9 @@
  *
  * RECORDING PRECOMP "Recording"  (source-resolution canvas, e.g. 2560x1440)
  *   ├── <cursor> Cursor       (one shape layer per sprite; opacity expr
- *   │                          shows it when Cursor Style === its index)
+ *   │                          shows it when the effective Style Index === its slot)
  *   ├── Cursor Position Null  (parent for the cursors; Position from Screen Pos + smoothing)
- *   ├── Style Driver          (null with Dropdown "Cursor Style" — hold-keyed from CURSOR_<style> events)
+ *   ├── Style Driver          (null carrying Auto Cursor / Cursor Style / Recorded Style / Size / Smoothness)
  *   ├── Screen Pos            (null with Point Control "Screen Pos" — linear-keyed from MOVE events)
  *   └── Screen Recording Footage  (raw.mkv)
  *
@@ -115,9 +115,10 @@
 
     // ── Style mapping. The recorder emits CURSOR_<NAME> events; this
     //    table maps each NAME to the JSON cursor's 0-based index. The
-    //    AE-side Cursor Style dropdown then uses 1 = Auto (Recorded),
-    //    2 = Hidden and 3..N+2 for the cursors (see the dynamic
-    //    cursorDefs build below).
+    //    AE-side Style Index then uses 1 = Hidden and 2..N+1 for the
+    //    cursors (see the dynamic cursorDefs build below). Both the
+    //    Cursor Style dropdown and the Recorded Style slider use this
+    //    numbering.
     var PYTHON_STYLE_TO_JSONIDX = {
         "arrow":      0,
         "text":       1,
@@ -318,10 +319,9 @@
         // ── Cursor definitions from Cursor_Sprite.json ───────────
         // Parse every cursor layer, recover its 0-based index from the
         // embedded Bodymovin opacity expression (falls back to array
-        // order), and sort. The AE Cursor Style dropdown is then:
-        //   1        = Auto (Recorded)
-        //   2        = Hidden
-        //   3 .. N+2 = the cursors, ascending JSON-index order
+        // order), and sort. AE Style Index is then:
+        //   1        = Hidden
+        //   2 .. N+1 = the cursors, ascending JSON-index order
         // Drop a new sprite layer into the JSON and it automatically
         // joins the dropdown and gets built — no script edits needed.
         var cursorDefs = [];
@@ -337,25 +337,32 @@
             });
         }
         cursorDefs.sort(function (a, b) { return a.jsonIdx - b.jsonIdx; });
-        // Dropdown layout: 1 = Auto (Recorded), 2 = Hidden,
-        // 3 .. N+2 = the cursors in ascending JSON-index order.
-        var dropdownItems  = ["Auto (Recorded)", "Hidden"];
+        // Dropdown layout: 1 = Hidden, 2 .. N+1 = the cursors in
+        // ascending JSON-index order.
+        var dropdownItems  = ["Hidden"];
         var jsonIdxToAeIdx = {};
         for (var cd = 0; cd < cursorDefs.length; cd++) {
-            cursorDefs[cd].aeIdx = cd + 3;          // 1 = Auto, 2 = Hidden
+            cursorDefs[cd].aeIdx = cd + 2;          // 1 = Hidden
             dropdownItems.push(cursorDefs[cd].name);
             jsonIdxToAeIdx[cursorDefs[cd].jsonIdx] = cursorDefs[cd].aeIdx;
         }
         var firstCursorIdx = cursorDefs.length ? cursorDefs[0].aeIdx : 1;
 
         // ── Style Driver null ────────────────────────────────────
-        // A single "Cursor Style" dropdown drives which cursor shows.
-        // It is HOLD-keyed straight from the recorder's CURSOR_<style>
-        // events, so out of the box the cursor auto-follows whatever
-        // the OS actually displayed (arrow / I-beam / hand / drag).
-        // To pin one cursor for the whole clip, delete its keyframes
-        // and pick a value. Cursor Size and Cursor Smoothness round
-        // out the cursor knobs.
+        // Three knobs:
+        //   • Auto Cursor   — checkbox, default ON. Cursor follows the
+        //                     recorded OS-cursor track (Recorded Style).
+        //                     Turn OFF to hand-pick a cursor with
+        //                     Cursor Style instead.
+        //   • Cursor Style  — manual dropdown picker, used only when
+        //                     Auto Cursor is OFF. (It stays interactive
+        //                     even when Auto is ON, but is ignored.)
+        //   • Recorded Style — hold-keyed slider baked from the
+        //                     recorder's CURSOR_<style> events. The
+        //                     "auto" track itself; not really meant to
+        //                     be edited by hand, but visible so you can
+        //                     see / nudge keyframes.
+        // Cursor Size + Cursor Smoothness round out the cursor knobs.
         var styleLayer = recComp.layers.addNull(duration);
         styleLayer.name = "Style Driver";
         styleLayer.guideLayer = true;
@@ -363,29 +370,31 @@
         // Add every effect FIRST, then re-acquire fresh references —
         // holding a Property handle across later addProperty() calls
         // invalidates it in some AE versions ("Object is invalid").
+        styleLayer.Effects.addProperty("ADBE Checkbox Control").name = "Auto Cursor";
         var hasDropdown = true;
         try {
             styleLayer.Effects.addProperty("ADBE Dropdown Control");
         } catch (eDrop) {
             // Pre-2020 AE has no Dropdown Menu Control — fall back to a
-            // plain slider for the cursor picker.
+            // plain slider for the manual picker.
             hasDropdown = false;
             styleLayer.Effects.addProperty("ADBE Slider Control");
         }
+        styleLayer.Effects.addProperty("ADBE Slider Control").name = "Recorded Style";
         styleLayer.Effects.addProperty("ADBE Slider Control").name = "Cursor Size";
         styleLayer.Effects.addProperty("ADBE Slider Control").name = "Cursor Smoothness";
 
-        // The cursor picker is the 1st effect added. A freshly added
-        // Dropdown Menu Control cannot be renamed until its menu items
-        // are set, so address it by index ("Cursor Style" lookups would
-        // return null) and rename it once it's initialised.
-        var styleFxIdx = 1;
+        // The manual cursor picker is the 2nd effect added. A freshly
+        // added Dropdown Menu Control cannot be renamed until its menu
+        // items are set, so address it by index ("Cursor Style" lookups
+        // would return null) and rename it once it's initialised.
+        var styleFxIdx = 2;
 
+        styleLayer.Effects.property("Auto Cursor").property(1).setValue(1);
         styleLayer.Effects.property("Cursor Size").property(1).setValue(200);
         styleLayer.Effects.property("Cursor Smoothness").property(1).setValue(0);
 
-        // Cursor picker: dropdown items "Auto (Recorded)" + "Hidden" +
-        // cursor names.
+        // Manual cursor picker: dropdown items "Hidden" + cursor names.
         if (hasDropdown) {
             try {
                 styleLayer.Effects.property(styleFxIdx).property(1)
@@ -404,16 +413,18 @@
             }
         }
         styleLayer.Effects.property(styleFxIdx).name = "Cursor Style";
+        styleLayer.Effects.property(styleFxIdx).property(1)
+            .setValue(firstCursorIdx);
         if (!hasDropdown) {
             // Slider fallback — snap to whole numbers.
             styleLayer.Effects.property(styleFxIdx).property(1)
                 .expression = "Math.round(value);";
         }
 
-        // Hold-key the picker straight from the recorder's CURSOR_<style>
-        // events, times remapped through frame_times so it stays glued
-        // to the footage. AE's setValuesAtTimes needs strictly
-        // increasing times, so collect, sort, and collapse ties.
+        // Recorded Style: hold-keyed from CURSOR_<style> events, times
+        // remapped through frame_times so it stays glued to the
+        // footage. AE's setValuesAtTimes needs strictly increasing
+        // times, so collect, sort, and collapse ties.
         var styleSamples = [];
         for (var ei = 0; ei < events.length; ei++) {
             var ev = events[ei];
@@ -444,20 +455,19 @@
             styleTimes.push(styleSamples[si].t);
             styleVals.push(styleSamples[si].v);
         }
-
-        var styleProp = styleLayer.Effects.property(styleFxIdx).property(1);
         if (styleTimes.length === 0) {
             // No CURSOR_<style> samples (e.g. non-Windows recording) —
             // pin to the first cursor so something shows.
-            styleProp.setValue(firstCursorIdx);
-        } else {
-            styleProp.setValuesAtTimes(styleTimes, styleVals);
-            for (var ki = 1; ki <= styleProp.numKeys; ki++) {
-                styleProp.setInterpolationTypeAtKey(
-                    ki,
-                    KeyframeInterpolationType.HOLD,
-                    KeyframeInterpolationType.HOLD);
-            }
+            styleTimes = [0];
+            styleVals  = [firstCursorIdx];
+        }
+        var recStyleProp = styleLayer.Effects.property("Recorded Style").property(1);
+        recStyleProp.setValuesAtTimes(styleTimes, styleVals);
+        for (var ki = 1; ki <= recStyleProp.numKeys; ki++) {
+            recStyleProp.setInterpolationTypeAtKey(
+                ki,
+                KeyframeInterpolationType.HOLD,
+                KeyframeInterpolationType.HOLD);
         }
 
         // ── Cursor Position Null ─────────────────────────────────
@@ -477,16 +487,16 @@
             'p;';
 
         // ── Cursor shape layers ──────────────────────────────────
-        // The "Cursor Style" picker is hold-keyed with the recorded OS
-        // cursor track. Index 1 ("Auto (Recorded)") — only seen when a
-        // recording had no cursor samples — falls back to the first
-        // cursor so something always shows. Each cursor layer shows
-        // when the rounded index equals its aeIdx.
+        // Effective Style Index = Auto Cursor ? Recorded Style track :
+        // manual Cursor Style picker. Each cursor shows when the
+        // rounded effective index equals its aeIdx.
         var styleSelExpr =
             'var d = thisComp.layer("Style Driver");\n' +
-            'var idx = d.effect("Cursor Style")(' +
-                (hasDropdown ? '"Menu"' : '"Slider"') + ');\n' +
-            'if (idx <= 1) idx = ' + firstCursorIdx + ';\n';
+            'var auto = d.effect("Auto Cursor")("Checkbox");\n' +
+            'var idx = auto > 0.5\n' +
+            '    ? d.effect("Recorded Style")("Slider")\n' +
+            '    : d.effect("Cursor Style")(' +
+                (hasDropdown ? '"Menu"' : '"Slider"') + ');\n';
         // Build in reverse aeIdx order so the lowest index (first
         // cursor) ends up on top of the layer stack.
         var cursorLayers = [];
@@ -720,9 +730,11 @@
               "Main comp 'Controls': Padding, Roundness, Shadow, Glass Halo,\n" +
               "Halo Opacity, Zoom Level (1.0 = no zoom), Zoom Position\n" +
               "([0.5, 0.5] = centred), BG Color A / B.\n" +
-              "Recording precomp 'Style Driver': Cursor Style (hold-keyed\n" +
-              "with the recorded OS cursor — delete its keyframes to pin one\n" +
-              "cursor), Cursor Size, Cursor Smoothness.");
+              "Recording precomp 'Style Driver': Auto Cursor (on = follow\n" +
+              "the recorded OS cursor, off = use the manual picker),\n" +
+              "Cursor Style (manual dropdown), Recorded Style (hold-keyed\n" +
+              "data track from CURSOR_<style> events), Cursor Size,\n" +
+              "Cursor Smoothness.");
     } catch (err) {
         var detail = "Import failed: " + err.toString();
         if (typeof err.line !== "undefined" && err.line !== null) {

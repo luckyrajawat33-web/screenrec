@@ -928,6 +928,7 @@ class Recorder:
         self._left_down  = False        # left mouse button currently held
         self._drag_active = False       # a held-button drag is in progress
         self._press_xy   = (0, 0)       # screen pos of the last left press
+        self._force_resample = False    # ask the cursor sampler to re-emit
 
     def _now(self):
         return time.perf_counter() - self._t0
@@ -964,6 +965,15 @@ class Recorder:
                 if pressed:
                     self._press_xy = (x, y)
                 else:
+                    if self._drag_active:
+                        # A drag just ended — ask the cursor sampler
+                        # to re-emit the real OS cursor at its next
+                        # tick. The sampler's own prev_drag transition
+                        # also handles this, but it can miss drags
+                        # shorter than the sampling interval (~33 ms),
+                        # leaving the synthetic CURSOR_CLOSEDHAND
+                        # stuck on screen until the next style change.
+                        self._force_resample = True
                     self._drag_active = False
 
     def _on_scroll(self, x, y, dx, dy):
@@ -1139,9 +1149,13 @@ class Recorder:
                         # CURSOR_CLOSEDHAND on the way in, so force a
                         # re-emit of whatever the OS shows now (it may be
                         # unchanged from before the drag and would
-                        # otherwise be suppressed).
-                        if prev_drag and not self._drag_active:
+                        # otherwise be suppressed). _force_resample
+                        # covers drags shorter than one sampler tick,
+                        # where the prev_drag transition would be missed.
+                        if (prev_drag and not self._drag_active) \
+                                or self._force_resample:
                             last_style = None
+                            self._force_resample = False
                         prev_drag = self._drag_active
 
                         if user32.GetCursorInfo(ctypes.byref(info)):
