@@ -966,13 +966,18 @@ class Recorder:
                     self._press_xy = (x, y)
                 else:
                     if self._drag_active:
-                        # A drag just ended — ask the cursor sampler
-                        # to re-emit the real OS cursor at its next
-                        # tick. The sampler's own prev_drag transition
-                        # also handles this, but it can miss drags
-                        # shorter than the sampling interval (~33 ms),
-                        # leaving the synthetic CURSOR_CLOSEDHAND
-                        # stuck on screen until the next style change.
+                        # Drag just ended. Emit a fallback CURSOR_ARROW
+                        # right here so the bundle always carries a
+                        # revert keyframe, even if the cursor sampler
+                        # thread missed the drag (drags shorter than the
+                        # ~33 ms sampling interval) or didn't run at all
+                        # (offscreen-DIB setup failure, recording stopped
+                        # within one tick of release). The sampler's
+                        # next tick will refine this with the real OS
+                        # cursor — _force_resample forces it to fire.
+                        with self._lock:
+                            self._events.append(
+                                (self._now(), "CURSOR_ARROW", x, y))
                         self._force_resample = True
                     self._drag_active = False
 
